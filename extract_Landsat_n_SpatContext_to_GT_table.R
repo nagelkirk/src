@@ -29,24 +29,24 @@ run.spatial.context <- T # Set this to true if you want to extract the spatial c
 #  Variables and Directories 
 ###########################################################################################################
 # Set working directory to ParkData folder on dropbox
-# setwd("E:/Dropbox/Permanent/Grad School/Projects/EleTree/data/ParkData")
-setwd("~/Dropbox/Permanent/Grad School/Projects/EleTree/data/ParkData")
+setwd("E:/Dropbox/Permanent/Grad School/Projects/EleTree/data/ParkData")
+# setwd("~/Dropbox/Permanent/Grad School/Projects/EleTree/data/ParkData")
 
 # Set the folder for all the CSVs
 csv.folder <- "E:/Dropbox/Permanent/Grad School/Projects/EleTree/analysis/Landsat_v_woody_cover_regressions/"
 
 # Source the functions
-# source("E:/Dropbox/Permanent/Grad School/src_functions/src_masterfunctions.R")
-source("~/Dropbox/Permanent/Grad School/src_functions/src_masterfunctions.R")
+source("E:/Dropbox/Permanent/Grad School/src_functions/src_masterfunctions.R")
+# source("~/Dropbox/Permanent/Grad School/src_functions/src_masterfunctions.R")
 
-# final.df.csv <- "E:/Dropbox/Permanent/Grad School/Projects/EleTree/analysis/Landsat_v_woody_cover_regressions/TwelvePark_Landsat_n_GT_values.csv"
-final.df.csv <- "~/Dropbox/Permanent/Grad School/Projects/EleTree/analysis/Landsat_v_woody_cover_regressions/TwelvePark_Landsat_n_GT_values.csv"
+final.df.csv <- "E:/Dropbox/Permanent/Grad School/Projects/EleTree/analysis/Landsat_v_woody_cover_regressions/TwelvePark_Landsat_n_GT_values.csv"
+# final.df.csv <- "~/Dropbox/Permanent/Grad School/Projects/EleTree/analysis/Landsat_v_woody_cover_regressions/TwelvePark_Landsat_n_GT_values.csv"
 
-# final.df.w.SpatialContext <- "E:/Dropbox/Permanent/Grad School/Projects/EleTree/analysis/Landsat_v_woody_cover_regressions/TwelvePark_Landsat_n_GT_values_w_SpatContext.csv"
-final.df.w.SpatialContext <- "~/Dropbox/Permanent/Grad School/Projects/EleTree/analysis/Landsat_v_woody_cover_regressions/TwelvePark_Landsat_n_GT_values_w_SpatContext.csv"
+final.df.w.SpatialContext <- "E:/Dropbox/Permanent/Grad School/Projects/EleTree/analysis/Landsat_v_woody_cover_regressions/TwelvePark_Landsat_n_GT_values_w_SpatContext.csv"
+# final.df.w.SpatialContext <- "~/Dropbox/Permanent/Grad School/Projects/EleTree/analysis/Landsat_v_woody_cover_regressions/TwelvePark_Landsat_n_GT_values_w_SpatContext.csv"
 
-# final.df.tran <- "E:/Dropbox/Permanent/Grad School/Projects/EleTree/analysis/Landsat_v_woody_cover_regressions/AllTwelveParks_Landsat_n_GT_values_TRANS.csv"
-final.df.tran <- "~/Dropbox/Permanent/Grad School/Projects/EleTree/analysis/Landsat_v_woody_cover_regressions/AllTwelveParks_Landsat_n_GT_values_TRANS.csv"
+final.df.tran <- "E:/Dropbox/Permanent/Grad School/Projects/EleTree/analysis/Landsat_v_woody_cover_regressions/AllTwelveParks_Landsat_n_GT_values_TRANS.csv"
+# final.df.tran <- "~/Dropbox/Permanent/Grad School/Projects/EleTree/analysis/Landsat_v_woody_cover_regressions/AllTwelveParks_Landsat_n_GT_values_TRANS.csv"
 
 # List the parks
 park.names <- c("Chobe", "Kruger", "Limpopo", "Mpala", "Murchison", "North_Luangwa", "QWE", "Ruaha", "Selous", "Serengeti", "South_Luangwa")
@@ -54,10 +54,11 @@ park.names <- c("Chobe", "Kruger", "Limpopo", "Mpala", "Murchison", "North_Luang
 # Identify the folder with the Landsat images
 landsat.folder <- "X:/nagelki4/Projects/EleTree/data/Landsat/20km_Buffer"
 
-# List only the images that are max or min, but not the minmax 
-# (that's actually how I exported them from GEE, so we're good to go by just specifying "reflectance")
-landsat.rasters <- list.files(landsat.folder, pattern = "minmax_NDVI_wo_indices_allBands.tif", full.names = T)
-
+# List only the images that are max min or tran but not the minmaxtran
+landsat.rasters <- list.files(landsat.folder, pattern = "_min_NDVI_wo_indices_allBands.tif", full.names = T)
+landsat.rasters <- c(landsat.rasters, list.files(landsat.folder, pattern = "_max_NDVI_wo_indices_allBands.tif", full.names = T))
+landsat.rasters <- c(landsat.rasters, list.files(paste0(landsat.folder, "/With_shoulder"), pattern = "_tran_", full.names = T))
+landsat.rasters <- landsat.rasters[!grepl("00000000", landsat.rasters)]
 
 
 #########################################################################################################################
@@ -100,11 +101,7 @@ for(i in 1:length(park.names)){
   # The extracted values are going to be ordered by cell number, so do the same here to make the points match up
   truth.df <- truth.df[order(truth.df$park.pxl.num), ]
   
-  if(tran.image.included){
-    # For the trans images, we'll revise the landsat.rasters
-    landsat.rasters <- list.files(paste0(landsat.folder, "/With_shoulder"), pattern = "_tran_", full.names = T)
-    landsat.rasters <- landsat.rasters[!grepl("00000000", landsat.rasters)]
-  }
+ 
   
   # Subset the image list to only images from the current park.
   park.images <- grep(park, landsat.rasters, value = T)
