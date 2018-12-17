@@ -8,6 +8,7 @@
 # This code was written to go through the first round of the 2016 MESMA results and compare them to ground truth.
 # Outputs table and plots.
 
+# This is a PC only code because it uses VCF files from the HPCC X drive 
 
 
 
@@ -38,7 +39,11 @@ memory.limit(size = 50000) # default: 16308
 #############################  SET WORKING DIRECTORY  ######################################################################
 # Set working directory to where the results will be saved
 setwd("E:/Dropbox/Permanent/Grad School/Projects/EleTree/pubs/MethodsPaper/analysis/accuracy_assessments")
-# setwd("~/Dropbox/Permanent/Grad School/Projects/EleTree/z_pub_archives/MethodsPaper/analysis/accuracy_assessments")
+# setwd("~/Dropbox/Permanent/Grad School/Projects/EleTree/pubs/MethodsPaper/analysis/accuracy_assessments")
+
+# Set the location to save the results
+save.location <- "E:/Dropbox/Permanent/Grad School/Projects/EleTree/pubs/MethodsPaper/data/MESMA/results/"
+
 
 #################################  Variables  #################################################################
 park.names <- c("Chobe", "Kruger", "Limpopo", "Mpala", "Murchison", "North_Luangwa", "QWE", "Ruaha", "Selous", "Serengeti", "South_Luangwa")
@@ -470,5 +475,5 @@ for(i in 1:length(park.names)){
 }
   
 # Write the file 
-write.csv(complete.table, paste0(getwd(), "/all_MESMAs_appended_to_GT.csv"), row.names = F)
+write.csv(complete.table, paste0(save.location, "all_MESMAs_appended_to_GT.csv"), row.names = F)
 

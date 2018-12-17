@@ -7,7 +7,7 @@
 # Takes all the csvs from the MCU and SMA GEE code and combines them into one large csv
 
 # Set the working directory
-setwd("~/Dropbox/Permanent/Grad School/Projects/EleTree/pubs/MethodsPaper/data/MCU_n_SMA/Extracted_Values_from_GEE/20181205")
+setwd("~/Dropbox/Permanent/Grad School/Projects/EleTree/pubs/MethodsPaper/data/MCU_n_SMA/results/20181205")
 
 # We'll need the park list
 park.names <- c("Chobe", "Kruger", "Limpopo", "Mpala", "Murchison", "North_Luangwa", "QWE", "Ruaha", "Selous", "Serengeti", "South_Luangwa")
@@ -27,6 +27,14 @@ for(i in 1:length(f.list)){
   f.short <- f.iteration[, c("system.index", "Count", "first", "name")]
   # Get the "pxl" column as well. However, that column has different names, so use "px" as the pattern
   f.short$park.pxl <- f.iteration[, grep("px", names(f.iteration))]
+  f.short <- cbind(f.short, f.iteration[, grep("hnd_t_30", names(f.iteration))])
+  f.short <- cbind(f.short, f.iteration[, grep("hand_tr", names(f.iteration))])
+  f.short <- cbind(f.short, f.iteration[, grep("hnd_t_90", names(f.iteration))])
+  if(ncol(f.short) < 7){
+    f.short$hand.90 <- NA # need to do this because Mpala and Kruger won't have a hand.90
+  }
+  # Give it names that will agree with MESMA results
+  names(f.short)[(ncol(f.short)-1):ncol(f.short)] <- c("hand.tree.30", "hand.tree.90")
   
   # Then add the park names by lookin at the first three letters and finding the name in the park list
   # that matches
@@ -45,5 +53,4 @@ for(i in 1:length(f.list)){
 # Write the file
 write.csv(growing.tbl, file = "./all_MCUnSMA_results_combined.csv")
 
-# Ruaha, Selous, 
-names(f.iteration)
+

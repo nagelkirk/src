@@ -151,6 +151,7 @@ for(k in 1:length(park_names)){
       # Also loads any prior merged file
       if(file.exists(paste0(substr(final.tif.name, 1, nchar(final.tif.name)-17), "_wo_indices_allBands.tif"))){
         brick_merged <- brick(paste0(substr(final.tif.name, 1, nchar(final.tif.name)-17), "_wo_indices_allBands.tif"))
+        print(paste0("Loaded: ", paste0(substr(final.tif.name, 1, nchar(final.tif.name)-17), "_wo_indices_allBands.tif")))
       }else if(length(images_to_merge) > 1){
         merge.start <- tick()
         print(paste0("Merging file: ", final.tif.name))
@@ -166,16 +167,17 @@ for(k in 1:length(park_names)){
         # Set 0 to NA
         NAvalue(brick_merged[[t]]) <- 0
         
-        # Trim the top and bottom values based on the band (NDVI and MSAVI2 have diff value ranges)
-        if(t <= band_breaker){ 
-          # values below zero or >10000 are no good
-          values(brick_merged[[t]])[values(brick_merged[[t]]) > 10000] <- NA # Set high and low values to NA
-          values(brick_merged[[t]])[values(brick_merged[[t]]) <= 0] <- NA # Set anything below zero to NA. This wasn't done for Kruger and Mpala, but those points will be outliers in the TGS maps, and eliminated there. 
-        }else{
-          # Change the values outside the range to NA (these are the index bands, though they should no longer exist)
-          values(brick_merged[[t]])[values(brick_merged[[t]]) > 1000] <- 1000
-          values(brick_merged[[t]])[values(brick_merged[[t]]) < -1000] <- -1000 # Could also increase index values to 10,000 scale by *10 here
-        }
+        # I decided not to trim the values because 1) it was slow and 2) those points are unlikely to be included in any accuracy assessment
+        # # Trim the top and bottom values based on the band (NDVI and MSAVI2 have diff value ranges)
+        # if(t <= band_breaker){ 
+        #   # values below zero or >10000 are no good
+        #   values(brick_merged[[t]])[values(brick_merged[[t]]) > 10000] <- NA # Set high and low values to NA
+        #   values(brick_merged[[t]])[values(brick_merged[[t]]) <= 0] <- NA # Set anything below zero to NA. 
+        # }else{
+        #   # Change the values outside the range to NA (these are the index bands, though they should no longer exist)
+        #   values(brick_merged[[t]])[values(brick_merged[[t]]) > 1000] <- 1000
+        #   values(brick_merged[[t]])[values(brick_merged[[t]]) < -1000] <- -1000 # Could also increase index values to 10,000 scale by *10 here
+        # }
       }
       
       
@@ -222,6 +224,7 @@ for(k in 1:length(park_names)){
     # Write the maxmintran images 
     writeRaster(rednirswir_brick, paste0(substr(final.tif.name, 1, nchar(final.tif.name) - 25), "maxmintran_NDVI_red_nir_swir1"), format = "ENVI", overwrite = TRUE, datatype = 'INT2S') 
     writeRaster(maxmintran_brick, paste0(substr(final.tif.name, 1, nchar(final.tif.name)-25), "maxmintran_NDVI_wo_indices_allBands"), format = "ENVI", overwrite = TRUE, datatype = 'INT2S')
+    print("Wrote the maxmintran path images. Going to next path in park.")
     
     # Then remove the temp files that have been stored on the C drive. Hopefully everything but the rasters was stored on RAM
     removeTmpFiles()
