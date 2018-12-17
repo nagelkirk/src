@@ -1,0 +1,1650 @@
+// This script does four things:
+//    1. Exports park imagery
+//    2. Exports backdrop image for ground truth
+//    3. MCU and SMA
+//    4. Does accuracy assessment of MCU and SMA
+
+// GT modification:
+//    1. Bring in the gt points for each park.
+//    2. Bring in the ground truth values.
+//    3. Use the points to extract MCU and SMA values and add those values to the ground truth table as new columns
+//    4. Export that table to Google Drive, so it can be loaded later 
+//    5. Download the tables from GEE or do the plotting and accuracy assessment in EE (with RMSE etc)
+
+// If you want to export more minmax images, modify the code to exclude trans images (use a 'getTrans' switch)
+
+
+/////////////////  Functions  //////////////////////////////////////////////////////////////
+// Multiply first image by all bands (cloudy values, 0, penetrate the whole stack this way)
+var multiplyImages = function(image, first){
+  return ee.Image(first).multiply(image);
+};
+
+// Function to get rid of 0 values and set to NA (hopefully)
+var zMask = function(image) { // this didn't work
+  var clouds = image.select(['pixel_qa']); // can pick any band
+  return image.updateMask(clouds.neq(0)); // you select the values you want to keep
+};
+
+// Function masks clouds. Identifies what is clear skies (<1) and masks all else
+// LC8 : clear == 322
+// LC5&4&7, clear == 66 and water == 96 and 224 (could reduce a collection based on those values to get rivers)
+var LC8_cloudMask = function(image) {
+  var clouds = image.select(['pixel_qa']); 
+  return image.updateMask(clouds.eq(322)); // 322 is clear. 324 is water, and that could be used to get 
+  // maps of water from this same function, except change to .eq(324) (or look what I said 4 lines up)
+  // 992, 480, 352, 416 were all clouds, but likely decreasing confidence in cloud
+  // 328 is shadow
+  // figured these out by opening in Arc and displayed unique values
+};
+
+var LC457_cloudMask = function(image) {
+  var clouds = image.select(['pixel_qa']); 
+  return image.updateMask(clouds.eq(66)); // 322 is clear. 324 is water, and that could be used to get 
+  // maps of water from this same function, except change to .eq(324) (or look what I said 4 lines up)
+  // 992, 480, 352, 416 were all clouds, but likely decreasing confidence in cloud
+  // 328 is shadow
+  // figured these out by opening in Arc and displayed unique values
+};
+
+// This function gets the number of images listed in 'to_mosaic'
+// It then adds that number as a new field, 'image_num'
+var addNum = function(img) {
+  var oneimg = ee.Image(img);
+  var molist = ee.List(oneimg.get('to_mosaic'));
+  var mergenum = molist.size();
+  return img.set({'image_num': mergenum});
+};
+
+var getNum = function(img, list) {
+  var oneimg = ee.Image(img);
+  var num = oneimg.get('image_num');
+  return ee.List(list).add(num);
+};
+
+var getDATEtext = function(image, datestring) {
+  var img = ee.Image(image)
+  var date = ee.String(img.get('system:index')).slice(11, 20)
+  return ee.String(datestring).cat(date)
+}
+var getYEAR = function(img, list) {
+  var oneimg = ee.Image(img);
+  var num = oneimg.get('Year');
+  return ee.List(list).add(num);
+};
+
+var getNDVI = function(img, list) {
+  var oneimg = ee.Image(img);
+  var num = ee.Number(oneimg.get('NDVI_mean'));
+  return ee.List(list).add(num);
+};
+
+var getImage_name = function(img, list){
+  var oneimg = ee.Image(img);
+  var img_name = oneimg.get('system:index');
+  return ee.List(list).add(img_name);
+};
+
+// Function to add year to each image
+var addYEAR = function(img){
+  var oneimg = ee.Image(img);
+  // Get ymd
+  var dateAcquired = ee.String(oneimg.get('SENSING_TIME'));
+  //print('date_acquired', dateAcquired);
+  // Get year
+  var yearAcquired = ee.String(dateAcquired.slice(0, 4));
+  //print('year_acquired', yearAcquired);
+  // Assign the year as a new attribute
+  return img.set({'Year': yearAcquired});
+};
+
+
+var addDATE_PROJ_YEAR = function(img){
+  var oneimg = ee.Image(img);
+  var dateAcquired = ee.String(oneimg.get('SENSING_TIME'));
+  var shortDateAcquired = ee.String(dateAcquired.slice(0, 10));
+  var yearAcquired = ee.String(dateAcquired.slice(0, 4));
+  var proj1 = ee.Image(oneimg).projection();  
+  return img.set({'DATE_ACQUIRED': shortDateAcquired}).set({'Year': yearAcquired}).set({'projection': proj1});
+};
+
+
+// Function to add date to each image
+var addDATE = function(img){
+  var oneimg = ee.Image(img);
+  // Get ymd
+  var dateAcquired = ee.String(oneimg.get('SENSING_TIME'));
+  //print('date_acquired', dateAcquired);
+  // Get year
+  var shortDateAcquired = ee.String(dateAcquired.slice(0, 10));
+  //print('year_acquired', yearAcquired);
+  // Assign the year as a new attribute
+  return img.set({'DATE_ACQUIRED': shortDateAcquired});
+};
+
+// Function to set 'to_mosaic' to a new value (wrapping in an external function failed for some reason)
+var setPROPERTY = function(img){
+  var newimg = img.set({'to_mosaic': 0});
+  return newimg;
+};
+
+// Function to calculate the cloud cover in the park itself
+var calcParkCloudCover = function(img){
+  // Get the image
+  var image = ee.Image(img);
+  // Clip to the park
+  var cl_img = image.clip(boundary); 
+  // Get the cfmask band 
+  var cl_cf = cl_img.select('pixel.qa');
+  // Set the cloud pixels to 1, rest to 0, then multiply by 100 to get percentages as integers
+  var cl_reclass = cl_cf.neq(322).multiply(100); 
+  // Do reduce region mean or one or the mean calc I came up with
+  var park_cloud_cover = cl_reclass.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: boundary.geometry(),
+    scale: 300,
+    maxPixels: 1e12
+  });
+  // Set the property, will be called 'pixel_qa' - didn't find a way to name it myself
+  return img.set(park_cloud_cover);
+};
+
+
+// Function groups images by the discriminator, then pastes them all in new property
+// Annotations aren't totally up to date (discriminator == DATE_ACQUIRED, property = to_mosaic)
+function addFILTER(collection, discriminator, property, delete_to_mosaic){
+  // Gets images with unique dates and collects the first one with that date, it appears
+  // That means that not all the scenes are listed 
+  var distinct_dates = collection.distinct([discriminator]);
+  // Now create a new collection of images with the names listed in distinct_dates
+  var distinct_images = ee.ImageCollection(distinct_dates);
+  
+  // Join collection to itself grouped by date
+  // This will filter images based on their dates (all with same dates grouped together). 
+  // That allows them to be grouped together and mosiacked
+  // This first step simply creates the filter criteria to be used ('DATE_ACQUIRED')
+  var date_eq_filter = ee.Filter.equals({leftField: discriminator,
+                                       rightField: discriminator});
+  //print("date_eq_filter", date_eq_filter);
+  // This step is creating a path for the Join.saveAll function to be used next
+  // and creates the name the list will be assigned: "to_mosaic"
+  var saveall = ee.Join.saveAll(property);
+  //print("saveall", saveall);
+  // If wanted to reset 'to_mosaic', this will set it to 0
+  if(delete_to_mosaic === true){
+    collection = collection.map(setPROPERTY);
+  }
+  // This applies the previous object's function
+  // It joins the distinct images (180 total) to all the original imagery (649 total)
+  // It does the join based on the date using the date_eq_filter
+  // So it's putting together all the images with the same date and grouping
+  // using the distinct_images as the group name
+  var mosaic_dates = saveall.apply(distinct_images, collection, date_eq_filter);
+  return mosaic_dates;
+}
+
+// Change the number format of the bands to int16 so they are all the same and can be exported
+function selectImageNcast(collection, image_name){
+  var img = ee.ImageCollection(collection)
+    .filter(ee.Filter.eq('system:index', image_name));
+var img1 = ee.Image(img.first());
+var img2 = img1.int16();
+return img2;
+}
+
+// Function sets the number of images that are in a complete path for all the images/paths in a collection
+var addPathImgMax = function(collection, imageMax){
+    // Start mapped function
+    var addImageMax = function(img){
+      return img.set({'max_images': imageMax});
+    };
+    return collection.map(addImageMax);
+  };
+  
+// Function sets the min NDVI for a year and path 
+var addYearPathNDVImin = function(collection, minNDVI){
+    // Start mapped function
+    var addNDVImin = function(img){
+      var im = ee.Image(img);
+      return im.set({'NDVI_years_min': minNDVI});
+    };
+    return collection.map(addNDVImin);
+  };
+
+
+///// Function to mosaic and calculate NDVI and MSAVI2 for the collections
+var landsatMosaicIndexCalc = function(imageCollection, boundary, minPath, maxPath, nirBand, redBand){
+  
+  
+  ////STEPS of function (more or less)
+  // For each satellite:
+  // 1. Get all imagery underlying park boundary
+  // 2. Mask clouds and water
+  // 3. Clip out the park
+  // 4. Mosaic based on dates
+  // 5. Calculate NDVI and MSAVI2
+  
+  // They don't have to go into diff paths, because the date is what is used to mosaic them
+  // So can keep as one stack and put all together at the end into one stack, then plot
+  
+  // Mappable clip function 
+  var clipped = function(img){
+    return img.clip(boundary);
+  };
+  
+  // Used to use the cloudmask below, mapped it along with clipped
+  var LC8_filtered = ee.ImageCollection(imageCollection).map(clipped);
+  //print('filtered', LC8_filtered);
+  
+  // Run function to add property of images to be mosaicked (they'll have the same date)
+  var LC8_mosaic_dates = addFILTER(LC8_filtered, 'DATE_ACQUIRED', "to_mosaic");
+  //print(LC8_mosaic_dates);
+  // Map the addNum function across all images to create new category with number 
+  // of 'to_mosaic' images 
+  var LC8_newcollection = LC8_mosaic_dates.map(addNum);
+  //print('LC8_newcollection', LC8_newcollection);
+  
+  ///////////  ADD YEAR  ////////////////////////////////////////////////////
+  // Map the year function
+  var LC8_yr = LC8_newcollection.map(addYEAR);
+  //print('LC8_yr', LC8_yr);
+ 
+ 
+  ///////////////////  MOSAIC  ///////////////////////////////////////////////////////////////////
+  // This creates a variable and has a new function imbedded within the call
+  // The function is easiest read backwards and is mapped across all mosaic_images
+  // The function mosaics images from each element in the 'to_mosaic' list 
+  // (each element has several landsat scenes with the same date),
+  // then creates an image collection from those mosaicked images
+
+  function createMOSAIC(collection){
+    var mosaicked_collection = ee.ImageCollection(collection).map(function(img) {
+      var startTime = img.get('system:time_start');
+      var yr = img.get('Year');
+      var date = img.get('DATE_ACQUIRED');
+      var path = img.get('WRS_PATH');
+      //var imCRS = img.get('crs');
+      //var imTRAN = img.get('transform');
+      var proj = img.get('projection');
+      var newCollection = ee.ImageCollection.fromImages(img.get('to_mosaic')).mosaic(); 
+      return newCollection.set({'system:time_start': startTime})
+      .set({'Year': yr})
+      .set({'DATE_ACQUIRED': date})
+      .set({'WRS_PATH': path})
+      //.set({'crs': imCRS})
+      //.set({'transform': imTRAN})
+      .set({'projection': proj});
+    });
+    return mosaicked_collection;
+  }
+  
+  // Run the mosaic function 
+  var LC8_path168_mos = createMOSAIC(LC8_yr);
+  //print('LC8_path168_mos', LC8_path168_mos);
+  //var first_mos = ee.Image(LC8_path168_mos.first());
+  //var imgband = first_mos.select('B3');
+  //Map.addLayer(imgband, {}, 'imgband');
+  
+
+  ////////////  5. Calculate NDVI and MSAVI2  //////////////////////////////////////////////////////////
+  // Create the NDVI function 
+  var addNDVI = function(img){
+    var image1 = ee.Image(img);
+    var nir = image1.select(nirBand);
+    var red = image1.select(redBand);
+    var numerator = nir.subtract(red);
+    var denominator = nir.add(red);
+    var ndvi_raw = numerator.divide(denominator);
+    var ndvi = ndvi_raw.multiply(1000).rename('NDVI'); // could round the number to 0 decimals
+    return image1.addBands(ee.Image(ndvi));
+  };
+
+  // Create the MSAVI2 function (these could be made into functions that take a collection and nirBand and redBand as inputs)
+  var addMSAVI2 = function(img) {
+    var image1 = ee.Image(img);
+    var nir = image1.select(nirBand);
+    var red = image1.select(redBand);
+    // Equation is broken up into parts to make it somewhat easier to follow
+    // Maybe would run just as well using * / ^ and so forth, but decided to use GEE functions in case it's faster
+    var chunk1 = nir.multiply(2).add(1);
+    var chunk2 = chunk1.multiply(chunk1);
+    var chunk3 = nir.subtract(red).multiply(8);
+    var chunk4 = chunk2.subtract(chunk3).sqrt();
+    var msavi2 = chunk1.subtract(chunk4).divide(2).multiply(1000).rename('MSAVI2'); 
+    return image1.addBands(msavi2);
+  };
+  
+  // Add the NDVI & MSAVI2 bands to the stack
+  var withNDVI = LC8_path168_mos.map(addNDVI);
+  var withNDVI_n_MSAVI2 = withNDVI.map(addMSAVI2); 
+  //print('withNDVI_n_MSAVI2', withNDVI_n_MSAVI2);
+  return withNDVI_n_MSAVI2;
+};
+
+// Function to run the NDVI and MSAVI2 Calculation and plot
+var calcINDICES_n_MERGE = function(boundary, minPath, maxPath){ // This could take a collection that is 
+// already merged across satellites, after having been filtered by dates. 
+// landsatMosaic below would then have to set the red and nir bands for each image based on the satellite
+  
+  // Calc the indices and put them in one stack imageCollection, cloudCoverThreshold, boundary, minPath, maxPath, nirBand, redBand
+  if(LC8_year.length().getInfo() > 0){
+    var index_LC8 = landsatMosaicIndexCalc(LC8, boundary, minPath, maxPath, 'B5', 'B4');
+  }
+  if(LC4_year.length().getInfo() > 0){
+    var index_LC4 = landsatMosaicIndexCalc(LC4, boundary, minPath, maxPath, 'B4', 'B3');
+    index_LC8 = index_LC8.merge(index_LC4);
+  }
+
+  if(LC5_year.length().getInfo() > 0){
+    var index_LC5 = landsatMosaicIndexCalc(LC5, boundary, minPath, maxPath, 'B4', 'B3');
+    index_LC8 = index_LC8.merge(index_LC5);
+  } 
+  
+  if(LC7_year.length().getInfo() > 0){
+    var index_LC7 = landsatMosaicIndexCalc(LC7, boundary, minPath, maxPath, 'B4', 'B3');
+    index_LC8 = index_LC8.merge(index_LC7);
+  }  
+  
+  //print('index_LC8', index_LC8);
+  return index_LC8;
+}
+
+
+// Function gets the image dates specific to a park and satellite
+var getDates = function(x, sat, park) {
+  // Filter table down to just that park and satellite
+  var x_dates = x.filter(ee.Filter.eq('Satellite', sat))
+      .filter(ee.Filter.eq('GEE_park', park));
+  // Get all the dates
+  var dates = x_dates.aggregate_array('DATE_ACQUIRED');
+  return dates;
+};
+
+// Function to add transform and crs to each image
+var addProjection = function(img){
+  var oneimg = ee.Image(img);
+  // Get ymd
+  var proj1 = ee.Image(oneimg).projection();  
+  // Get year
+  //var projhome = proj1.getInfo();
+  //var crs_home = projhome['crs'];
+  //var tran_home = projhome['transform'];
+  // Assign the year as a new attribute
+  return img.set({'projection': proj1});
+};
+
+// Function sets the pixels with no clouds or water or anything to 1
+var LC8_setClearTo1 = function(img){return ee.Image(img.eq(322))};
+
+
+
+
+
+
+
+
+/////////////////  Variables  ////////////////////////////////////////////////////////////////
+var park_name = "South_Luangwa";   // "Kruger", "Chobe", "Limpopo", "Serengeti", "Mara", "Selous", "Ruaha", "Mpala", "QWE", "Murchison", "North_Luangwa", "South_Luangwa", "North_South_Luangwa", "Kruger_Limpopo",
+if(park_name == "Selous" | park_name == "Serengeti_Mara" | park_name == "Serengeti" |
+    park_name == "Ruaha" | park_name == "Murchison" | park_name == "QWE"){
+    var cloud_cover = 35;  
+  } else if(park_name == "Mara"){
+    var cloud_cover = 30;
+  } else var cloud_cover = 10;
+
+
+/////// Export backdrop image?
+var export_backdrop_image = false;
+var export_image = false;
+var export_MCU_value_table = true;
+
+/////// Where to Export to?
+var export_folder = 'Ele_Tree'; // 20181205 is the MCU table folder
+
+/////// Run MCU?
+var run_MCU = true;
+// How many models?
+var mcu_models = 300; 
+
+/////// Which image to unmix? Do one at a time
+var unmix_min = false;
+var unmix_max = false;
+var unmix_minmax = false;
+var unmix_min_rns = false; // rns stands for an image with only the red, nir and swir2 bands 
+var unmix_max_rns = false;
+var unmix_minmax_rns = false;
+
+if(unmix_min){
+  var img_unmix = 'min_NDVI_wo_indices_allBands';
+}else if(unmix_max){
+  var img_unmix = 'max_NDVI_wo_indices_allBands';
+}else if(unmix_minmax){
+  var img_unmix = 'minmax_NDVI_wo_indices_allBands';
+}else if(unmix_min_rns){
+  var img_unmix = 'min_NDVI_rednirswir';
+}else if(unmix_max_rns){
+  var img_unmix = 'max_NDVI_rednirswir';
+}else if(unmix_minmax_rns){
+  var img_unmix = 'minmax_NDVI_rednirswir';
+}
+
+
+///////////////////  GET DATES  ////////////////////////////////////////////////////////////////
+// This R code steps in here to create a table of dates that are then loaded in
+// R code:E:\Dropbox\Permanent\Grad School\Projects\EleTree\src\Census and GEE\ImageDownloader\Subset_ImageDates_by_min_n_max_NDVI_for_GEE_ImageDownloader.R
+
+// Load and subset the table you want to use
+// used min and max NDVI. Drive file name: Landsat_image_4year_span_dates_singleParks_minmaxNDVI_twentykmbuffer_shp_n_parkCloudCover
+var date_table_20km_parkCloud_4yr_spans_minmaxNDVI = ee.FeatureCollection('ft:1h9OJ8e4sY5rcWmnJSlSjefR1bPSzSfLJ33bSREI9'); 
+var date_table = date_table_20km_parkCloud_4yr_spans_minmaxNDVI;
+//print('date_table', date_table)
+
+// 2. Get the dates respective to the park and satellite
+//var LC8_dates = ee.List(getDates(date_table, "LC8", park_name));
+//var LC7_dates = ee.List(getDates(date_table, "LE7", park_name));
+//var LC5_dates = ee.List(getDates(date_table, "LT5", park_name));
+//var LC4_dates = ee.List(getDates(date_table, "LT4", park_name));
+
+//print(LC8_dates);
+//print(LC7_dates);
+//print(LC5_dates);
+//print(LC4_dates);
+
+// Define shapefiles and paths
+// The buffers all start with the park as distance 0 and include all beyond that to the buffer extent
+// That means a 50km buffer has the 20km buffer as a part of it
+// Something to maybe do is do a 30km buffer out from the 20 in order to make the 50km, so 50km and 20km will
+// be separate
+if(park_name == "Kruger"){
+  var mnPath = 168; // Both of these are likely getting too many or too few rows
+  var mxPath = 169;
+  var mnRow = 75;
+  var mxRow = 78;
+  
+  
+  // Bring in the ground truth point location file
+  var gt_points = ee.FeatureCollection('ft:1qyKPOgDv0Vrdapv6b1iyPKTy23HxrXfyT6w6WFiA')
+
+  // Bring in the ROIs from ENVI
+  // Number the variable names starting with the lowest path number, so here path 168 is tree1
+  var tree1 = ee.FeatureCollection('ft:1zvszDmGAVixKSNLcJYS4xiFSF0QPuHhYo1PFj18B').set({'WRS_PATH': 168}).set({'Name': 'tree'});
+  var grass1 = ee.FeatureCollection('ft:1fMXk7tIpGK0gTbihxwbypcO1iHDIA9wMhpCqFs8s').set({'WRS_PATH': 168}).set({'Name': 'grass'});
+  var soil1 = ee.FeatureCollection('ft:1Es4EJyl6IaiX18wp6sa_PkF8j8dtpUliHjOqEJHC').set({'WRS_PATH': 168}).set({'Name': 'soil'});
+  var tree2 = ee.FeatureCollection('ft:1C1SSDe2NSCplbm7ADUYuQvp5vzFIsDXo1o5dSTZd').set({'WRS_PATH': 169}).set({'Name': 'tree'});
+  var grass2 = ee.FeatureCollection('ft:1UKqoU-N7M2jwJb96GOaEVun-YS7L2mlH5ocK_VU2').set({'WRS_PATH': 169}).set({'Name': 'grass'});
+  var soil2 = ee.FeatureCollection('ft:1EHkx-uoCWH52R1RdjwXSc8ltjSbe51HvU5FWM8hY').set({'WRS_PATH': 169}).set({'Name': 'soil'});
+  // Put in one collection  
+  var allROI = ee.FeatureCollection([tree1, grass1, soil1, tree2, grass2, soil2]);
+
+
+  // Load boundaries (fusion table) (The others are in my gmail account's drive folder)
+  //There are also fusion table links for the buffers themselves (not donuts / holes)
+  var boundary = ee.FeatureCollection('ft:1JtBMIXQmHqUlQvng9fRGAQOvFcv_2pnsXnXaffCl');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1-a7PqUq_ruIdrRbyUANHumTddRABcrS3JfTD1bpH');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1Ga8HURGDzKWFQQzWQOKpek1x90pkdbToUMrRjSGj');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1IBDCO2Ly_sCyXYLw8btvY2L8h-Zv6Aks6-kn5rT6');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1vwqysa9tuyGDdLHO7FLWL_b2UJWuyeID3Xs1uGpq');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1KCGYRX90TnSGaLEkr8CjO_YiKKvmD-OoIL78RXfu');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1lXXiXC7FAsBvG0tVEgnlA0nA2hz5huSBocwCfeDj');
+  // Display park shapefile
+  //Map.addLayer(kruger_shp, {color: 'FF0000'}, 'colored');
+} 
+
+
+if(park_name == "Limpopo"){
+  var mnPath = 168;
+  var mxPath = 168; // To get the whole park, include 169. But it isn't needed for the study, because Kruger's buffer captures what of Limpopo is in path 169
+  var mnRow = 75;
+  var mxRow = 77;
+  
+  // Bring in the ground truth point location file
+  var gt_points = ee.FeatureCollection('ft:1vDbw6mSWWhCrG596vSS0PI6GhoLEWR9wUbcVcA38');
+
+  
+  // Bring in the ROIs from ENVI
+  // Number the variable names starting with the lowest path number, so here path 168 is tree1
+  var tree1 = ee.FeatureCollection('ft:1WfCl3JLHkJ5BOrEY8FAI7YEgDxdxhjnRFzB-M2X9').set({'WRS_PATH': 168}).set({'Name': 'tree'});
+  var grass1 = ee.FeatureCollection('ft:1-cc2m7BqGXbwdA1ft-qI4NyOADRJuZ6eu-QoN9pz').set({'WRS_PATH': 168}).set({'Name': 'grass'});
+  var soil1 = ee.FeatureCollection('ft:1HsdoULk5cZbeIV70coGoIApQ6jNXYNst9AdBA0jM').set({'WRS_PATH': 168}).set({'Name': 'soil'});
+  // Put in one collection  
+  var allROI = ee.FeatureCollection([tree1, grass1, soil1]);
+  
+  
+  var boundary = ee.FeatureCollection('ft:1CqDt7vRnKQzcK1H3RCIPDoHYi4V1F_Uxm3Pn7tQB');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1h3S1rfa3T9WmO0SBgbtzCGwNaiUT0i9Wn0KKD3nf');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1vv4TqG0U31NpXRQ0oesg4lJ_BZO6pDq5kdVjhuCJ');    
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1noERpEVcjhxf0_l331buVTdFIrWM94ou2fwyShU0');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:165CObd5ua3pMx-VzGUJBchuusoGmn_lFBoZD20wY');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1-I9OSNRHL0ZV-_YWm5rfpgBF7hY41D9Bva44VjUo');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1S7K7h7Zw56mhLUmsTWSs5x02vU1MoaBybTX9GCKk');
+  //var limpopo_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1CROHVuksufJDpg5kdQekNymYsaQCwf6aXw9rRfTP');
+}
+
+if(park_name == "Kruger_Limpopo"){
+  var mnPath = 168;
+  var mxPath = 169;
+  var mnRow = 75;
+  var mxRow = 78;
+  
+  var boundary = ee.FeatureCollection('ft:1LoUaXZeWmYo-uJ26mFSqpyK13TUaEPkPKwBN0t6J');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1xcuPVRvAS34BglcvXNuWNrBsCxass9LhvqVEKUks');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1TITMFvtB63m9hYVXenPDgLisOOXJS52hVdluqAhp');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1NBk6TPfbVYlidy31F9e2DTwkaBzO48StC-HhYhvJ');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1JZ5c7Bw7ggPqFwycw9_DFReu_5wcQO38rK3n-hbV');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1ySI1_Ko9SyhgBJb8HZahJIIpMnCVsTx3Emn-8eSx');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1lkQ1cbM4ra5odUXOdKZXWy6LAhG6MdvFnBe074ya');
+}
+
+if(park_name == "Chobe"){
+  var mnPath = 174; // To get all of Chobe, include path 173. Because it looked like <5% of the park area, I left that path out. 
+  var mxPath = 174;
+  var mnRow = 72;
+  var mxRow = 73;
+  
+  // Bring in the ground truth point location file
+  var gt_points = ee.FeatureCollection('ft:15TQpLSIIZsHs3dhVTabArDhumJ3BGfo1TW04MebO');
+
+  // Bring in the ROIs from ENVI
+  // Number the variable names starting with the lowest path number, so here path 168 is tree1
+  //var tree1 = ee.FeatureCollection('ft:1mXo0EC3M5pTyZsxi7XdfuuYhdRKVlcj0sNCYt0T6').set({'WRS_PATH': 173}).set({'Name': 'tree'});
+  //var grass1 = ee.FeatureCollection('ft:1t1BZz-lfbIUFGCPjsmu8hqlGO28ILVR6-VT3dtJ1').set({'WRS_PATH': 173}).set({'Name': 'grass'});
+  //var soil1 = ee.FeatureCollection('ft:19c2cNjjbP6CV2qtzURPvG_mkJju-N18F7EV9UVZ-').set({'WRS_PATH': 173}).set({'Name': 'soil'});
+  var tree1 = ee.FeatureCollection('ft:1Z0g0RvP6pnHs4XUFOyGN1Dz1cmAQAge2IuqWgqOk').set({'WRS_PATH': 174}).set({'Name': 'tree'});
+  var grass1 = ee.FeatureCollection('ft:1x4x5k9TLx7PeOrB2LIYu3aYVx9UCBvEKkkGmYLdX').set({'WRS_PATH': 174}).set({'Name': 'grass'});
+  var soil1 = ee.FeatureCollection('ft:1oO1FJcNjJD6lbjuSQKPtzViiWLmI0VfCF1Mnj3Lu').set({'WRS_PATH': 174}).set({'Name': 'soil'});
+  // Put in one collection  
+  var allROI = ee.FeatureCollection([tree1, grass1, soil1]);
+  
+  var boundary = ee.FeatureCollection('ft:15f2DSWA8bQWQDcgCDGtrYMN-RMkaCJR5DeQfnK6b');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1mVIGURS72sOcaWWNoobTtoXWSHTHLiHXmdEyOquf');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1-i3IApOlhB2zXXv6sRbYNXFP0QAcPeM7omvjsHJb');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:19XvZniYlHMRuPuyq8bvRWzo2yPEI27_fYpNpD9Kl');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1qSYX8Vq9rK_xWuU6sNe_T1QVk18aYmsDuPVURW3y');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1-i3IApOlhB2zXXv6sRbYNXFP0QAcPeM7omvjsHJb');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1URtTIhzVaHFoC_8NRB3Gey3dkWHnnlqmNhnwlN5f');
+  //var chobe_100kmBuffer_shp = ee.FeatureCollection('ft:1xZTTXQVTvx7VCput7tEmqH5HFntslby6jbivbK7T');
+}
+
+if(park_name == "Serengeti_Mara"){
+  var mnPath = 169;
+  var mxPath = 170;
+  var mnRow = 61;
+  var mxRow = 62;
+  
+  // Bring in the ground truth point location file
+  var gt_points = ee.FeatureCollection('ft:1mBF7BxBuYceIfsCOt0FVu1QM4Pr8h6cH-cAOAClo')
+
+  // Bring in the ROIs from ENVI
+  // Number the variable names starting with the lowest path number, so here path 168 is tree1
+  var tree1 = ee.FeatureCollection('ft:13pW8g8TT3b-BWbsDXATiAVVirzsNQC6dlwFesZg5').set({'WRS_PATH': 169}).set({'Name': 'tree'});
+  var grass1 = ee.FeatureCollection('ft:1BILZKseL7vOfuaywPfJoQ5F3xJk7ZLPAnbo9u7QT').set({'WRS_PATH': 169}).set({'Name': 'grass'});
+  var soil1 = ee.FeatureCollection('ft:1cBNN6cGpUVAJRJ8gch9BmivRWzRILHg7hboB6nNq').set({'WRS_PATH': 169}).set({'Name': 'soil'});
+  var tree2 = ee.FeatureCollection('ft:1ZhRpqmC-galKPDne25HqdNughKEBmSu9Ev6iczx6').set({'WRS_PATH': 170}).set({'Name': 'tree'});
+  var grass2 = ee.FeatureCollection('ft:1FrBqCI-WGOyyNpKeWTcsqF3tccewLNDrlhqUVW6R').set({'WRS_PATH': 170}).set({'Name': 'grass'});
+  var soil2 = ee.FeatureCollection('ft:1SmMzG_yEhP-Pe9vLTSoOLiUdo-fAEJ15yeeoLbcV').set({'WRS_PATH': 170}).set({'Name': 'soil'});
+  // Put in one collection  
+  var allROI = ee.FeatureCollection([tree1, grass1, soil1, tree2, grass2, soil2]);
+  
+  var boundary = ee.FeatureCollection('ft:19qyB9900-C3yqE4eKhapRvffTQca6yKEt3914SGd');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1LROE3e-ag4jIvtuDXXlZdHwf-JWKIYxeisI0pQo0');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1XALWpUWk_UBLRsdfL54_qUmzoXxYIkrb0k094FY-');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1AR0C0H6jkJ-tIinQoxt0dZLtuiIknx1y4ac08UB2');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1bxLTex8JZNuOGpKGnywVlOfy9qkC80n3ahsw4eUx');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1vsoC9JWDVGDwh-u-cK7HTCM5QBvYVrPqJkcwjyzQ');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1sI_jRHRLvEpNFs9B5M-wTOxkPKrpDq8VSf4id5C4');
+  //var serengetiMara_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1QteNVXeR48WdSxXRcrcjxaIftXVI3zwCXBaVTUBr');
+}
+
+if(park_name == "Serengeti"){
+  var mnPath = 169;
+  var mxPath = 170;
+  var mnRow = 61;
+  var mxRow = 62;
+  
+  var boundary = ee.FeatureCollection('ft:1w9ZlY4vaBEp8D06d3p_4vjmzCuUOJpGTOvpRcrOg');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1FhhY6ZH8_067zZwgXsvNrc4pb4u8oyPqrCdCcr3C');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:121UY1rbW3as7VZW_ldmSJA93i2RMAzqs49-zIpAn');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:19S6QU2I_Y0oK-Y2FeI0AM4q5GcozVIrCOxiddRSr');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1Gr18xEhcQkzvLz7kqhMWC5wQbVVs0rplERcg4tKg');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1y_rlT__qs3Reg3d8z3ST74NWYCxKkgTtMeg5bm0n');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1nxuEAmxSJOEshmioVNXX7xwQP_R6GxD012v9yASy');
+}
+
+if(park_name == "Mara"){
+  var mnPath = 169;
+  var mxPath = 169;
+  var mnRow = 61;
+  var mxRow = 61;
+  
+  var boundary = ee.FeatureCollection('ft:1es_-JK9tLvRAoO4zSqP7hqmCGaBw7S9PDQcXheRR');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:10KZZgWh0o2qpDw1Ex8jTGprJnLxnkSoxtqjucu4L');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:10O-L7LeDhxrgIMVEUkhAfNbrN5U_SX9g8L7gZLVJ');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1ASQVb3CRwEomxP9MEJsUkBl1FdLAH-iIAYeFeXzE');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1AP4aF_wTa5KOHlQxyAXzIcqCJyhdOOXsCp_jAtf5');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1pH72d5wzRVuKi96jevqnbdfRss09wnegU2wuuzgQ');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1OxXfGadyPegLl0gx4tQoZL80Wf3xCaQQxlCELPwD');
+}
+
+ 
+if(park_name == "Selous"){
+  var mnPath = 166;
+  var mxPath = 167;
+  var mnRow = 65;
+  var mxRow = 67;
+  
+  // Bring in the ground truth point location file
+  var gt_points = ee.FeatureCollection('ft:1_usuXwglupe0ZnFuzbL3t-PLNU33XZbJndUve_m6')
+  
+  // Bring in the ROIs from ENVI
+  // Number the variable names starting with the lowest path number, so here path 168 is tree1
+  var tree1 = ee.FeatureCollection('ft:147-b1tUdznnHHrYJC7iB5Jdvor1rfrGpSzBZ130y').set({'WRS_PATH': 166}).set({'Name': 'tree'});
+  var grass1 = ee.FeatureCollection('ft:1mKQ_swMuOVvq6oY5aWIfAcxDCkZIVLR7FIhmLv-f').set({'WRS_PATH': 166}).set({'Name': 'grass'});
+  var soil1 = ee.FeatureCollection('ft:1GnVhxYiraRvS5RXiiDLqKzQyAZ3DMr3npeIblE-Z').set({'WRS_PATH': 166}).set({'Name': 'soil'});
+  var tree2 = ee.FeatureCollection('ft:10C21cUpRD8nQM1RmktntSYYgBL5RRxXOqxp6vwo7').set({'WRS_PATH': 167}).set({'Name': 'tree'});
+  var grass2 = ee.FeatureCollection('ft:1FjQhBe_5P87A_FQZiwy2gKu7vI0VxxvX_koPTEtR').set({'WRS_PATH': 167}).set({'Name': 'grass'});
+  var soil2 = ee.FeatureCollection('ft:1D9dBHQx7NMAMEeOvK9ACrPM1wBbBYTB42V_QdXnB').set({'WRS_PATH': 167}).set({'Name': 'soil'});
+  // Put in one collection  
+  var allROI = ee.FeatureCollection([tree1, grass1, soil1, tree2, grass2, soil2]);
+  
+  //Map.addLayer(tree1)
+  //Map.addLayer(grass1)
+  //Map.addLayer(soil1)
+  
+  // Bring in the boundary files  
+  var boundary = ee.FeatureCollection('ft:1RKBrEwD1Pbh02vlXSWfo6FtZI4cFJSIIFnP3DWVL');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:180Ro9ATS5xe8QMWWFbQrIWK3YGwDTgWp5STjR43-');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1MSWpYM13AjHlZGJr8Md70Bttk1nLbIpggex-HrUm');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:15uMmUBdQ5PxVMLvHhp28hzH0wKR_bvJT-rRNReUh');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1CGN2wzlOvfIttPTD1al5fU_l0Zs0bleU6NYUjlD_');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1S_3tBH2f89kY-U2NY2iY7b4Rt-g5Qrowfub70su7');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1a-XhqYbn7qJLg9naJMOx_bMdzXP4psRoXlagSkHB');
+  //var selous_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1eSCHuWO8bAQQuO7XWAbHnF_foPkYobMbCuB2DyDt');
+}
+
+if(park_name == "Ruaha"){
+  var mnPath = 168; // 168 could have been discarded, but in that path, the park borders a stream network that could have interesting results
+  var mxPath = 169;
+  var mnRow = 65;
+  var mxRow = 66;
+  
+  // Bring in the ground truth point location file
+  var gt_points = ee.FeatureCollection('ft:1cFAmov4F2f7zexE4Ko0sVu4ko_ELuhYIAI-1fVFI')
+  
+  // Bring in the ROIs from ENVI
+  // Number the variable names starting with the lowest path number, so here path 168 is tree1
+  var tree1 = ee.FeatureCollection('ft:1OUNvCDFHEysnAeEh-9Ux2Y0d71d6s2t2NzD2qYtF').set({'WRS_PATH': 168}).set({'Name': 'tree'});
+  var grass1 = ee.FeatureCollection('ft:1F9bIWlt1DGwzHBwPMqi5Vdv9J0UClmfPCtC_cTde').set({'WRS_PATH': 168}).set({'Name': 'grass'});
+  var soil1 = ee.FeatureCollection('ft:1Ax_7z-BsB913vTNfD6eQ0mV_cJAgvQq0VFDHtZYr').set({'WRS_PATH': 168}).set({'Name': 'soil'});
+  var tree2 = ee.FeatureCollection('ft:1T0cTt397qC8mGcSNs7Op8aLCeR2-8mIH1Bi2HOkB').set({'WRS_PATH': 169}).set({'Name': 'tree'});
+  var grass2 = ee.FeatureCollection('ft:1zHMp_U0mZgxt3phdsltth6GBc5PSYqB-G4igF9vJ').set({'WRS_PATH': 169}).set({'Name': 'grass'});
+  var soil2 = ee.FeatureCollection('ft:16Q-BOrGhdETiQy5C4Brj4LXz3-uO0XitDpZi9uuh').set({'WRS_PATH': 169}).set({'Name': 'soil'});  
+  // Put in one collection  
+  var allROI = ee.FeatureCollection([tree1, grass1, soil1, tree2, grass2, soil2]);
+  
+  var boundary = ee.FeatureCollection('ft:1554Z5uvjb6PBBTZbrmAtcmE5NQVZoQ6hZgR3Vjen');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:15P2t0IxFa5eB-GEoJyBA7x4KBcMVkfqu6eB_ufh-');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1KaVRQYNoKNJ-b6ZoR3RBZhT8RSayEkenFwdJXc3v');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1jFLXnlsgGLdRw6fjpW3a1CSppWXoDNc7Pz8z3GCM');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1PgG02LZEW1gBoGzbEpadhUMnFbRt2CzslE3_f2LN');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1AnUe7aYpOfuFvgB2Hxpj4JiOi31qRICiKl2yHqUd');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1_n5svsTr8sE2GptEwO-1pAkpIINfnWoqQcVzH4Ht');
+  //var ruaha_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1i2GynVlv6saYJ3A6hRZNY7uG-A-YLdAD9KIMkgYC');
+}
+
+if(park_name == "QWE"){
+  var mnPath = 173;
+  var mxPath = 173;
+  var mnRow = 60;
+  var mxRow = 61;
+
+  // Bring in the ground truth point location file
+  var gt_points = ee.FeatureCollection('ft:1AxILOkoBqcoQLv9rhjmz1bSibH9CrBPYmZ0vFXuV')
+  
+  // Bring in the ROIs from ENVI
+  // Number the variable names starting with the lowest path number, so here path 168 is tree1
+  var tree1 = ee.FeatureCollection('ft:17a8oNy_TVJdp-QQiPHH6uxX7Lt5QgBKK9TmwhhBZ').set({'WRS_PATH': 173}).set({'Name': 'tree'});
+  var grass1 = ee.FeatureCollection('ft:1yrFLgr2Z0G0zC4yDzoPES0WjXOcA_3kYHbKdNsTe').set({'WRS_PATH': 173}).set({'Name': 'grass'});
+  var soil1 = ee.FeatureCollection('ft:1NrmaZsKcR4Z3xHEqWkmppxkSplEksmYs1UeYon94').set({'WRS_PATH': 173}).set({'Name': 'soil'});
+  // Put in one collection  
+  var allROI = ee.FeatureCollection([tree1, grass1, soil1]);
+
+  var boundary = ee.FeatureCollection('ft:1eiS83sX4VnynxpqWvxqz1rMmxv85MdQDUjhwDCSr');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1sCronmvrU3-g8S0yQV6bA3fCtNg1cBSEJMgB34HO');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1neLQJ_2Z7i7STpfQEDNli9nDAAmFXVb9nCv6Kq0p');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1WCG2RIcrFUnVvMLc1wRJqoX80OKYp9Klb3TLZUJL');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:13lS6CBDXClQge9-SqkLh-rIZr0jwjmgw7tm2vOZ2');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1k2KR4TrwbypuVcpgKl1AIFJto_Acm1QaUdiT-Xv-');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1sn0ni-W6se1tk0v9mP36pUH7EWfq_T2D2qc1L1Se');
+  //var qwe_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1po_hqxG6NaBsOoL88CCqlvbEoAdU-trqea-dLCzO');
+  
+  // Display park shapefile
+  //Map.addLayer(boundary, {color: 'FF0000'}, 'colored');
+}
+
+if(park_name == "Murchison"){
+  var mnPath = 172;
+  var mxPath = 172;
+  var mnRow = 58;
+  var mxRow = 59;
+    
+  // Bring in the ground truth point location file
+  var gt_points = ee.FeatureCollection('ft:1tYfsuHs-bxSjbmrHhDf1CU5VjbYdzS1bEFj_RAIo')
+  
+  // Bring in the ROIs from ENVI
+  // Number the variable names starting with the lowest path number, so here path 168 is tree1
+  var tree1 = ee.FeatureCollection('ft:1xQ39jNYXIBqtXbxOJV9eRzepez6-zipOQSxD_4ZJ').set({'WRS_PATH': 172}).set({'Name': 'tree'});
+  var grass1 = ee.FeatureCollection('ft:1WQy5S_pQNBDyIovADX_h0ulUVXtquST8KXXBuvod').set({'WRS_PATH': 172}).set({'Name': 'grass'});
+  var soil1 = ee.FeatureCollection('ft:1VUo8hAk6vSE8zzkYFeHSfs9nNuksvVogpQbHExfG').set({'WRS_PATH': 172}).set({'Name': 'soil'});
+  // Put in one collection  
+  var allROI = ee.FeatureCollection([tree1, grass1, soil1]);
+  
+  var boundary = ee.FeatureCollection('ft:1NOQ_uLw93IpRKWFnoxL-3lylAbtIiekwC8hx5YdS');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1aRx31xmoxcZ-YMeUGCaMxnrqvwcnKvhBzMSalSqO');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1Fl1JY_rWpLQ6rKx4rmFmW063VVc3nJKO21UFdOyx');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1xaMIqcP3Wn5Ia0e18DUVDgGIM5khBMfASzRqPlpB');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1Y8KPaL1A4lKNYdE4VEzK_S35ykGaM4XAEuf3GxHV');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1Bzgm1WK-9ukA_K8j5js1jlxWPoFAoooA5CVvhT6N');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1t_bFpNbCqpbUnqmyA-FJibhwW4PMmVVacI_TPBwn');
+  //var murchison_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1BdwKYd42rqOZOS2NkHBsT31wM0R-uc6Bg4ozPvI-');
+}
+
+
+if(park_name == "Mpala"){
+  var mnPath = 168;
+  var mxPath = 168;
+  var mnRow = 60;
+  var mxRow = 60;
+    
+  
+  // Bring in the ground truth point location file
+  var gt_points = ee.FeatureCollection('ft:1KX6wYGUgoXQ58x37fu_KQHw_lCAxKzOXOQZYQ8Qt');
+
+  
+  // Bring in the ROIs from ENVI 
+  var tree1 = ee.FeatureCollection('ft:1BPlA8PZ6HDXoKjH6maZGOc6sIKRkzL2RgJ2aDfBR').set({'WRS_PATH': 168}).set({'Name': 'tree'});
+  var grass1 = ee.FeatureCollection('ft:1VEaFXmyjh2aSYTtMxrAe5TlB1wtZC_WqO7vb2np6').set({'WRS_PATH': 168}).set({'Name': 'grass'});
+  var soil1 = ee.FeatureCollection('ft:1eWDg7A1zAes2djsvNmBt9gr6WWYvMJIiY-LiV8Ev').set({'WRS_PATH': 168}).set({'Name': 'soil'});
+  // Put in one collection  
+  var allROI = ee.FeatureCollection([tree1, grass1, soil1]);
+  
+  var boundary = ee.FeatureCollection('ft:1M1xIOuqKPOSyiHsAbk1lfN0W5j2mJvSTJg7g9UEc');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1H3oTA7KRiIS0QexderuJb5nY9SImtpGP4LMq8Lj8');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1GvgXbszvTxMH5aZep6bJr5NJ2GXHaNG0Dls2_Z86');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:16wS4hAPhQ2GMCHwsFnqtvMANYnaYDlKGnCgn6Qzi');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1283nQ-USEWsAL00ng_Cx_hcExmROCuTZqxZL_fnT');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1ltOZMba8l4_jOPw6Jw7ebMpp3vfdH5K6xLCYpP2i');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1FJE6Y41AtXEKLD8JwhI81A8fwCyDc7_2qN9PRXq4');
+  //var mpala_100kmbuffer_hole_shp = ee.FeatureCollection('ft:19gXljL-qSm5yIO96YAEL_iANlDROugZEWvJiXFa9');
+}
+
+if(park_name == "North_Luangwa"){
+  var mnPath = 170; // Part of the 20km buffer of North is in path 169. Because it was the bufffer, I discarded that path. 
+  var mxPath = 170; 
+  var mnRow = 68;
+  var mxRow = 68;
+    
+  
+  // Bring in the ground truth point location file
+  var gt_points = ee.FeatureCollection('ft:1eE48ByTZnU5y1zwswFW_Cd1HX9Fimo4njytHsgnx')
+  
+  // Bring in the ROIs from ENVI
+  // Number the variable names starting with the lowest path number, so here path 168 is tree1
+  var tree1 = ee.FeatureCollection('ft:1I7Yc8pWgwFN5PiOkOXNAdVcrK5ebFE-LxnzRfvJN').set({'WRS_PATH': 170}).set({'Name': 'tree'});
+  var grass1 = ee.FeatureCollection('ft:1yMXPrR-0omgEn42Cbobg9XPXZtxcEnRrwyaJKXAa').set({'WRS_PATH': 170}).set({'Name': 'grass'});
+  var soil1 = ee.FeatureCollection('ft:1-0AL7sO7EbChLGF5E1L1kA0IXR0wNJlISCTP3NHX').set({'WRS_PATH': 170}).set({'Name': 'soil'});
+  // Put in one collection  
+  var allROI = ee.FeatureCollection([tree1, grass1, soil1]);
+    
+  var boundary = ee.FeatureCollection('ft:1Lmb4JlcxZObLTTgg79coI9xpU9Nl8eRgx-810tiZ');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:18lqu7oX1n8yzg9taDBGV6KBIU5yOyF_tCIMPPXsj');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1-qmSEVa-6uoU6IG2a2OgIaaLjY_VOCC043ANkOcc');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1AJb3r48swPMAVYZZqak-KGEWK2hE66BXjita7pbg');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1BPyTsftBVIt9zBztMyrjwdiiqozztEftLfVuKNHt');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1CRxkrKYKmBixris7AAWDhz9N_X-EAvhzUSTthkbw');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:10y6xTifXYVqLzYeQLGxOjbno6NAaA0XMQ_DbJR4y');
+  //var north_luangwa_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1hUAmmKqu1vzTdmp0uHgocTaVSHqxY73f6Aab0EmU');
+
+  // Display park shapefile
+  //Map.addLayer(neg_1kmbuffer_hole_shp, {color: 'FF0000'}, 'colored');
+}
+
+if(park_name == "South_Luangwa"){
+  var mnPath = 170;
+  var mxPath = 170; // Should put north and south together since in the same path and could share endmembers
+  var mnRow = 69;
+  var mxRow = 70;
+  
+  // Bring in the ground truth point location file
+  var gt_points = ee.FeatureCollection('ft:1onnCpZqLgafSr_Ha3fVUcTbdQ0pnG--eROjs4Nm2')
+  
+  // Bring in the ROIs from ENVI
+  // Number the variable names starting with the lowest path number, so here path 168 is tree1
+  var tree1 = ee.FeatureCollection('ft:1b7AmVwBe-VRKFKuz1Rl6laczVk3iIcGoFNG4_pJ8').set({'WRS_PATH': 170}).set({'Name': 'tree'});
+  var grass1 = ee.FeatureCollection('ft:1R8MThlyN-CNY69_wFxAwspPsIuAJ1uvbEnc4JFwk').set({'WRS_PATH': 170}).set({'Name': 'grass'});
+  var soil1 = ee.FeatureCollection('ft:1I7hxW0drbGulhlJ5zKmy4CrRp8FeNFs_dmlAOxhd').set({'WRS_PATH': 170}).set({'Name': 'soil'});
+  // Put in one collection  
+  var allROI = ee.FeatureCollection([tree1, grass1, soil1]);
+  
+  var boundary = ee.FeatureCollection('ft:1tSe63wg4Jc_4-1RpAJLUhUlzo-9kt83PSPVwd0SP');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1YVEeacpmxUPZTCn34TG0P3xoyGVTZctXl937UfC_');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1efsv7MZBr4dlmXAWtk_ChiqKNm7NZn8vCbJk2kYS');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1axsPdCSc3pteqso9rN75PzzEAMC4JbTN7_9_RUIm');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1OTvAbyiG1BZgadKAs-ukq0MJqU-DHhVoMrs88PNO');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1HOyTEqfSJG8oBGgBpys4Ci_K5rI0DLjbPJbG78f6');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1T0MstQ90pSnz1rdZe0e7gl_37wg-PGMQIVeDFsJ7');
+  //var south_luangwa_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1Ck-DFa5w7RWBK6w64_wzOKOkXcR6W03jAXXYZW6h');
+}
+
+if(park_name == "North_South_Luangwa"){
+  var mnPath = 170; // Part of the 20km buffer of North is in path 169. Because it was the bufffer, I discarded that path. 
+  var mxPath = 170; // These are run separately because they have different dates for their lowest cloud cover 
+  var mnRow = 68;
+  var mxRow = 70;
+    
+  var boundary = ee.FeatureCollection('ft:1Q6goDCMeJKA5M5UALtLXbKzD0GQOKU6qw0QqNjbr');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1GSsndcilRblXcZXONjqtMMpohmdYHkY8TeWws98v');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1e6Il9z-aGpFRiGL8reoz4gE33n3h2EkRFWDVB3HJ');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1CJvBUBsg3tXQVXadtW8cVKq_xAfyX1B6G6iyFXJq');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1MYEkfFQXwB2k8M3kse_gUO_1o2WGKPXn0Scr1_R9');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1YgNxIevB-9WrweFotyEWGaXhRHb8tmBCt4UMn5-f');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1xe1H_mXi3nurVJZGcPUif-Yuohab7y5zDmxuqFNV');
+  //var north_south_luangwa_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1mdkJmfeV4luMGiKD0GNdQITGitCXZrsOOFDJwStk');
+}
+
+
+
+// The boundary you want the final exported images clipped to
+// This is also hardcoded into the mean and stdev index functions 
+var main_boundary = twentykmbuffer_shp;
+
+if(park_name == "Mpala"){
+  main_boundary = fiftykmbuffer_shp;
+}
+
+Map.centerObject(main_boundary);
+Map.addLayer(main_boundary);
+//Map.addLayer(gt_points);
+
+
+////////////////  SET DATES  ///////////////////////////////////////////////////////////////////////////
+// Manually set the dates for now based on R output
+// When going back in time, will need to recode this. Map across the date table
+// and do one row at a time, adding the images to a collection at the end. 
+// Can't just combine the dates, because some rows have dates that are from two different
+// satellites. 
+if(park_name == "Mpala"){
+  var LC8_dates = ee.List(['2016-10-22', '2016-05-31', '2016-08-19']); // these are in minmaxtrans order
+}else if(park_name == "Kruger"){
+  var LC8_dates = ee.List(['2016-10-06', '2016-10-29', '2016-03-28', '2016-04-20', '2016-06-16', '2016-07-09']);// These are all in minmaxtran order (minPathmin maxPathmin minPathmax maxPathmax minPathtran maxPathtran)
+}else if(park_name == "Limpopo"){
+  var LC8_dates = ee.List(['2016-10-22', '2016-04-13', '2016-07-02']);// '2016-10-29',  '2016-04-20', '2016-07-09' <- second path dates: the path was discarded These are in minmaxtran order 
+}else if(park_name == "Selous"){
+  var LC8_dates = ee.List(['2016-10-08', '2016-11-16', '2016-07-04', '2016-05-08', '2016-07-20', '2016-08-28']);//These are in minmaxtran order (minPathmin maxPathmin minPathmax maxPathmax minPathtran maxPathtran)
+}else if(park_name == "Chobe"){
+  var LC8_dates = ee.List(['2016-10-25', '2016-10-16', '2016-03-31', '2016-04-23', '2016-05-18', '2016-06-10' ]);// These are in minmaxtran order (minPathmin maxPathmin minPathmax maxPathmax minPathtran maxPathtran)
+}else if(park_name == "Serengeti"){
+  var LC8_dates = ee.List(['2016-09-11', '2016-09-02', '2016-02-16', '2016-05-13', '2016-06-23', '2016-06-30']);// These are in minmaxtran order (minPathmin maxPathmin minPathmax maxPathmax minPathtran maxPathtran)
+}else if(park_name == "Mara"){
+  var LC8_dates = ee.List(['2016-09-11', '2016-02-16', '2016-03-19']); //these are in minmaxtrans order
+}else if(park_name == "Serengeti_Mara"){
+  var LC8_dates = ee.List(['2016-09-11', '2016-09-02', '2016-02-16', '2016-05-13', '2016-06-23', '2016-06-30']); // These had the same image dates for the min and max NDVIs, so they were treated as one park, but had to force it for the tran image
+}else if(park_name == "Ruaha"){
+  var LC8_dates = ee.List(['2016-10-22', '2016-09-27', '2016-03-12', '2016-03-19', '2016-05-31', '2016-06-23']); // These are in minmaxtran order (minPathmin maxPathmin minPathmax maxPathmax minPathtran maxPathtran)
+}else if(park_name == "QWE"){
+  var LC8_dates = ee.List(['2016-01-27', '2016-11-26', '2016-10-25']); // is in min max trans order
+}else if(park_name == "Murchison"){
+  var LC8_dates = ee.List(['2016-01-20', '2016-05-27', '2016-01-04']); // is in min max trans order
+}else if(park_name == "North_Luangwa"){
+  var LC8_dates = ee.List(['2016-10-29', '2016-10-20', '2016-03-19', '2016-03-10', '2016-06-07', '2016-06-30']); // These are in minmaxtran order (minPathmin maxPathmin minPathmax maxPathmax minPathtran maxPathtran)
+}else if(park_name == "South_Luangwa"){
+  var LC8_dates = ee.List(['2016-10-20', '2016-03-26', '2016-06-30']);
+}
+
+// Get the length of the list and use to subset the dates
+var list_length = LC8_dates.length();
+var third_length = list_length.divide(3)
+var mindates = LC8_dates.slice(0,third_length);
+var maxdates = LC8_dates.slice(third_length,third_length.multiply(2));
+var transdates = LC8_dates.slice(third_length.multiply(2), list_length)
+
+print("mindates", mindates)
+print("maxdates", maxdates)
+print("transdates", transdates)
+print(LC8_dates)
+
+var LC8_year = ee.String('2016'); // Set this so the calc indices function works
+var LC7_year = ee.String('')
+var LC5_year = ee.String('')
+var LC4_year = ee.String('')
+
+
+///////////////////  GET IMAGERY  //////////////////////////////////////////////////////////////////////
+// Get the imagery // this is the best data (better than tier 2)
+var LC8 = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')  
+  .filterBounds(main_boundary)
+  .filter(ee.Filter.rangeContains('WRS_ROW',  mnRow, mxRow))
+  .filter(ee.Filter.rangeContains('WRS_PATH',  mnPath, mxPath))
+  .map(addDATE_PROJ_YEAR)
+  .filter(ee.Filter.inList('DATE_ACQUIRED', LC8_dates))
+  .select(["B.*", "pix.*"]);
+//.map(calcParkCloudCover)
+//.filter(ee.Filter.lt('pixel_qa', cloud_cover))
+
+
+//var LC7_sr = ee.ImageCollection('LANDSAT/LE07/C01/T1_SR')
+//  .filterBounds(main_boundary)
+//  .filter(ee.Filter.rangeContains('WRS_ROW',  mnRow, mxRow))
+//  .filter(ee.Filter.rangeContains('WRS_PATH',  mnPath, mxPath))
+//  .map(addProjection);
+//var LC5_sr = ee.ImageCollection('LANDSAT/LT05/C01/T1_SR')
+//  .filterBounds(main_boundary)
+//  .filter(ee.Filter.rangeContains('WRS_ROW',  mnRow, mxRow))
+//  .filter(ee.Filter.rangeContains('WRS_PATH',  mnPath, mxPath))
+//  .map(addProjection);
+//var LC4_sr = ee.ImageCollection('LANDSAT/LT04/C01/T1_SR')
+//  .filterBounds(main_boundary)
+//  .filter(ee.Filter.rangeContains('WRS_ROW',  mnRow, mxRow))
+//  .filter(ee.Filter.rangeContains('WRS_PATH',  mnPath, mxPath))
+//  .map(addProjection);
+//print("LC8", LC8);
+//print("LC7_sr", LC7_sr);
+//print("LC5_sr", LC5_sr);
+//print("LC4_sr", LC4_sr);
+
+
+
+
+// Calculuate Indices (will be image collections)
+var indx5 = calcINDICES_n_MERGE(main_boundary, mnPath, mxPath);
+//print('indx5', indx5);
+
+// Add the min max NDVI property
+indx5 = indx5.map(function(img){
+  var x = ee.Image(img)
+  var date = ee.String(x.get('DATE_ACQUIRED'))
+  return x.set({'minNDVI': LC8_dates.indexOf(date)})
+          //.set({'maxNDVI': maxdates.contains(date)})
+          //.set({'transNDVI': transdates.contains(date)})
+})
+
+//print('indx5', indx5)
+
+
+// Get rid of zeros
+//indx5 = ee.ImageCollection(indx5).map(zMask);
+
+// Map Boundary
+//Map.centerObject(main_boundary);
+//Map.addLayer(main_boundary, {}, 'main_boundary');
+
+
+
+//////////// STACK THEM ALL AS ONE IMAGE /////////////////////////////////////////
+// Combine all the bands into a single image
+// state object maintains its value each time. We are trying to use a map
+// function like we would use a for loop where we define an empty variable
+// the first time and then keep using that variable and add values to it
+// through iterations.
+
+var collectBands = function(image, state){
+  return ee.Image(state).addBands(image);
+};
+
+
+
+
+// Stack all the bands into the respective path images
+for(var i = mnPath; i <= mxPath; i++){ 
+  // This is our empty variable that will be getting bands added to it
+  var empty = ee.Image().select();
+  
+  // Subset to the path
+  var indx = ee.ImageCollection(indx5).filter(ee.Filter.eq('WRS_PATH', i))
+  //print('indx', indx)
+  
+  // Sort them based on minmax ndvi
+  indx = indx.sort('minNDVI', true)
+  //print('sorted_indx', indx)
+  
+  // Get the old projection 
+  var proj = indx.first().get('projection')
+  //print('proj', proj)
+  var year = indx.first().get('Year')
+  var systindx = indx.first().get('system:index')
+  var path = ee.String(indx.first().get('WRS_PATH')).slice(0, 3)
+  //print('path', path)
+
+  // Get the indexes to get the satellite names from later 
+  var sysindexlist = ee.List(indx.aggregate_array('system:index')) 
+  //print('sysindexlist', sysindexlist)
+  // Run function to get all the dates from system:indexes and paste together
+  var empty_date = ee.String('') 
+  var img_dates = indx.iterate(getDATEtext, empty_date)
+  //print('img_dates', img_dates)
+  
+  // Put all the bands in one image
+  var composite = ee.Image(indx.iterate(collectBands, empty)); 
+  //print(composite);
+  //Map.addLayer(composite)
+  
+   // As necessary, name the images and add the properties back
+  composite = composite.set({'system:index': ee.String(systindx).slice(0, 8).cat(img_dates).cat('_minmax_NDVI')})
+    .set({'projection': proj})
+    .set({'minSat': ee.String(sysindexlist.get(0)).slice(0, 4)}) 
+    .set({'maxSat': ee.String(sysindexlist.get(1)).slice(0, 4)})
+    .set({'tranSat':ee.String(sysindexlist.get(2)).slice(0, 4)})
+    .set({'WRS_PATH': indx.first().get('WRS_PATH')});
+    
+  if(run_MCU){
+    composite = composite.set({'image_selector_4_unmix': ee.String(img_unmix)});
+  }
+  
+  // Create red nir and swir1 min/max/minmax images 
+  // Get the specific names of the min and max NDVI image satellites 
+  var min_sat_name = composite.get('minSat').getInfo();
+  var max_sat_name= composite.get('maxSat').getInfo();
+  var trans_sat_name = composite.get('tranSat').getInfo();
+  
+  // Determine the bands for each image 
+  if(min_sat_name == "LC08"){
+    var rns_bands_min = ["B4", "B5", "B6"];
+    var allBands_min = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B10", "B11"];
+  }else{
+    var rns_bands_min = ["B3", "B4", "B5"];
+    var allBands_min = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B10", "B11"]; // THESE ARE WRONG
+  }
+  
+  if(max_sat_name == "LC08"){
+    var rns_bands_max = ["B4_1", "B5_1", "B6_1"];
+    var allBands_max =  ["B1_1", "B2_1", "B3_1", "B4_1", "B5_1", "B6_1", "B7_1", "B10_1", "B11_1"];
+  }else{
+    var rns_bands_max = ["B3_1", "B4_1", "B5_1"];
+    var allBands_max =  ["B1_1", "B2_1", "B3_1", "B4_1", "B5_1", "B6_1", "B7_1", "B10_1", "B11_1"]; // THESE ARE WRONG
+  }
+  
+  if(trans_sat_name == "LC08"){
+    var rns_bands_tran = ["B4_2", "B5_2", "B6_2"];
+    var allBands_tran =  ["B1_2", "B2_2", "B3_2", "B4_2", "B5_2", "B6_2", "B7_2", "B10_2", "B11_2"];
+  }else{
+    var rns_bands_tran = ["B3_1", "B4_1", "B5_1"];
+    var allBands_tran =  ["B1_1", "B2_1", "B3_1", "B4_1", "B5_1", "B6_1", "B7_1", "B10_1", "B11_1"]; // THESE ARE WRONG
+  }
+  
+  if(run_MCU){
+    // Designate the bands that will be in the unmixing image
+    // Because nothing includes the trans bands here, this allows all the normal minmax unmixing
+    // to proceed unchanged. 
+    if(img_unmix == 'min_NDVI_wo_indices_allBands'){
+      composite = composite.set({'bands_4_unmix_image': allBands_min});
+    }else if(img_unmix == 'max_NDVI_wo_indices_allBands'){
+      composite = composite.set({'bands_4_unmix_image': allBands_max});
+    }else if(img_unmix == 'minmax_NDVI_wo_indices_allBands'){
+      composite = composite.set({'bands_4_unmix_image': allBands_min.concat(allBands_max)});
+    }else if(img_unmix == 'min_NDVI_rednirswir'){
+      composite = composite.set({'bands_4_unmix_image': rns_bands_min});
+    }else if(img_unmix == 'max_NDVI_rednirswir'){
+      composite = composite.set({'bands_4_unmix_image': rns_bands_max});
+    }else if(img_unmix == 'minmax_NDVI_rednirswir'){
+      composite = composite.set({'bands_4_unmix_image': rns_bands_min.concat(rns_bands_max)});
+    }
+  }
+  
+  
+  /////////////  Apply composite cloud mask constructed from both images  //////////////////////////////////////
+  // Right now, the below section will clip out all clouds from min and max images, not trans
+  
+  // Get the pixel.qa bands from just the min and max images
+  var minmax_dates = mindates.cat(maxdates)
+  var minmax_images = ee.ImageCollection(indx).filter(ee.Filter.inList('DATE_ACQUIRED', minmax_dates))
+  
+  // Filter by 'pix.*'
+  var cloud_images = minmax_images.select('pixel.*');
+  //print(cloud_images)
+
+  // Create binary pixel.qa bands: clear pixels (322 in LC8) to 1
+  var clear2one_col = cloud_images.map(LC8_setClearTo1);
+  //print('clear2one_col', clear2one_col)
+  
+  // Get the first image
+  var first_cloud = ee.Image(clear2one_col.first());
+  //Map.addLayer(first_cloud)
+
+  // Multiply first binary pixel_qa image by all cloud layers (clouds == 0, so it penetrates all the bands)
+  var master_mask = ee.Image(clear2one_col.iterate(multiplyImages, first_cloud)); 
+  //print('master_mask', master_mask);
+
+  // Set the clear pixels to 1 (they will be all sorts of values due to the multiplication)
+  var master_mask_binary = ee.Image(master_mask.gt(0));
+  //Map.addLayer(master_mask_binary)
+
+  // Apply the mask
+  var masked = composite.updateMask(master_mask_binary.eq(1))
+  //print('masked', masked)
+  // Separate indices and bands for exporting - this will need an if statement like above once we go to other satellites
+  var composite_Indices = masked.select(["N.*", "M.*"])
+  var composite_noIndices_minNDVI = masked.select(["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B10", "B11"])
+  var composite_noIndices_maxNDVI = masked.select(["B1_1", "B2_1", "B3_1", "B4_1", "B5_1", "B6_1", "B7_1", "B10_1", "B11_1"])
+  var composite_noIndices_tranNDVI = masked.select(["B1_2", "B2_2", "B3_2", "B4_2", "B5_2", "B6_2", "B7_2", "B10_2", "B11_2"])
+  
+  // Change the names to indicate which is what
+  composite_Indices = composite_Indices.set({'system:index': ee.String(systindx).slice(0, 8).cat(img_dates).cat('_minmaxtran_NDVI_indexBands')})
+    .set({'projection': proj}).set({'WRS_PATH': indx.first().get('WRS_PATH')})
+  composite_noIndices_minNDVI = composite_noIndices_minNDVI.set({'system:index': ee.String(systindx).slice(0, 8).cat(img_dates).cat('_min_NDVI_reflectanceBands')})
+    .set({'projection': proj}).set({'WRS_PATH': indx.first().get('WRS_PATH')})
+  composite_noIndices_maxNDVI = composite_noIndices_maxNDVI.set({'system:index': ee.String(systindx).slice(0, 8).cat(img_dates).cat('_max_NDVI_reflectanceBands')})
+    .set({'projection': proj}).set({'WRS_PATH': indx.first().get('WRS_PATH')})
+  composite_noIndices_tranNDVI = composite_noIndices_tranNDVI.set({'system:index': ee.String(systindx).slice(0, 8).cat(img_dates).cat('_tran_NDVI_reflectanceBands')})
+    .set({'projection': proj}).set({'WRS_PATH': indx.first().get('WRS_PATH')})
+  
+  // Put them in one collection
+  var composite_wIndices = ee.ImageCollection([composite_noIndices_minNDVI, composite_noIndices_maxNDVI, composite_noIndices_tranNDVI, composite_Indices])
+    
+  // Combine the path-respective images into a collection 
+  if(i === mnPath){
+    var comp_collection = composite_wIndices;
+    var col_4_mcu = ee.ImageCollection(masked); // There are two versions, because one allows export of images and othe other allows continuation in the MCU
+  }else{
+    comp_collection = comp_collection.merge(composite_wIndices);
+    col_4_mcu = col_4_mcu.merge(ee.ImageCollection(masked));
+  }
+} 
+ 
+//print('comp_collection', comp_collection);
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////  BACKDROP IMAGE  ///////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////
+if(export_backdrop_image){
+  // Get the length. If it is greater than 1, mosaic. If not, set the values and move on to export
+  var backdrop_col = ee.ImageCollection(col_4_mcu);
+  //print('backdrop_col', backdrop_col);
+  var bd_length = backdrop_col.size().getInfo();
+  //print(bd_length);
+  if(bd_length === 2){
+    print("2 images");
+    // Merge them
+    backdrop_col = ee.Image(backdrop_col.mosaic());
+  }else{
+    print("only 1 image");
+    backdrop_col = ee.Image(backdrop_col.first());
+  }
+  
+  // Get the first band
+  var backdrop_img = ee.Image(backdrop_col.select("B1"));
+  
+  // Clip the image
+  backdrop_img = backdrop_img.clip(boundary);
+  
+  // Make the file smaller by setting all values greater than 0 equal to 1. This won't catch pixels greater than 10,000.
+  // For that reason, the R code will have to screen those out, along with those that now equal zero (the pixels that had values <= 0)
+  backdrop_img = backdrop_img.gt(0);
+  //print('bdimage', backdrop_img);
+  
+  //Map.addLayer(backdrop_img)
+  
+  // Add the properties back
+  backdrop_img = backdrop_img.set({'system:index': ee.String(systindx).slice(0, 4).cat(img_dates).cat('_backdropImage')})
+    .set({'projection': proj});
+
+  // Cast the image as a collection with the same name from before to be exported like all the other collections this code exports
+  comp_collection = ee.ImageCollection(backdrop_img);
+}
+
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+///////  MCU and SMA  /////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////
+if(run_MCU){
+  ///////////////////////////////////////////////////////////////////////////////////
+  // New way to do this:
+  // Make a list from 0-300
+  // Map over the list, taking the number as the input to the endmember selection
+  // Unmix the image and output the unmixed image
+  // That will yield a list of images that can be converted to a collection
+  // Take the mean of that collection
+  
+    // Make the list
+  var num_list = ee.List.sequence(1, mcu_models); // This is working. Tested list of 3 vs list of 30 and it yielded different mean MCU values
+  //print(num_list)
+  
+  // Function to replace the old image with the image to be unmixed
+  var createUnmixImage = function(img){
+    // Get the image and image designator 
+    var image_iteration = ee.Image(img);
+    var bands4unmix = ee.List(image_iteration.get('bands_4_unmix_image'));
+    
+    // Create the specific image for unmixing 
+    var unmImage = ee.Image(image_iteration.select(bands4unmix)); 
+    return unmImage;
+    //return image_iteration.set({'unmixImage': unmImage});
+  }; 
+  
+  // Function to add the ROI as properties 
+  var addROI = function(img){
+    // Start of map function
+    var image_iteration = ee.Image(img);
+    //print('imageit', image_iteration)
+    
+    // Get the path
+    var path_iteration = ee.Number(image_iteration.get('WRS_PATH'));
+    //print('path', path_iteration)
+    //print('minPath', mnPath)
+    // Get the ROIs
+    var threeROI = ee.FeatureCollection(allROI.filter(ee.Filter.eq('WRS_PATH', path_iteration)));
+    //print('3ROI', threeROI)
+    var tree = ee.FeatureCollection(threeROI.filter(ee.Filter.eq('Name', 'tree'))).flatten();
+    var grass = ee.FeatureCollection(threeROI.filter(ee.Filter.eq('Name', 'grass'))).flatten();
+    var soil = ee.FeatureCollection(threeROI.filter(ee.Filter.eq('Name', 'soil'))).flatten(); // I checked both images by mapping the ROIs, and they were added successfully
+   
+    return img.set({'treeROI': tree}).set({'grassROI': grass}).set({'soilROI': soil});
+  };
+  
+  // Map the functions  
+  var mcu_col = col_4_mcu.map(createUnmixImage);
+  mcu_col = mcu_col.map(addROI);
+  //print('mcu_col', mcu_col);
+  
+  
+  ///////  MCU  ////////////////////////////////////////////////////////////////////////////////////
+  ////// Function to map across all the images in mcu_col starts here ////////
+  var MCUmapper = function(img){
+    // Cast the image, just in case
+    var image = ee.Image(img);
+    // print('image', image)
+    
+    // Get the system index and appended names
+    var sysInd = ee.String(image.get('system:index'));
+    var name_append = ee.String(image.get('image_selector_4_unmix'));
+    var proj = image.get('projection');
+    var path_iteration = ee.Number(image.get('WRS_PATH'));
+ 
+    //print('path', path_iteration)
+    //print('minPath', mnPath)
+    // Get the ROIs
+    var threeROI = ee.FeatureCollection(allROI.filter(ee.Filter.eq('WRS_PATH', path_iteration)));
+    //print('3ROI', threeROI)
+    var tree = ee.FeatureCollection(threeROI.filter(ee.Filter.eq('Name', 'tree'))).flatten();
+    var grass = ee.FeatureCollection(threeROI.filter(ee.Filter.eq('Name', 'grass'))).flatten();
+    var soil = ee.FeatureCollection(threeROI.filter(ee.Filter.eq('Name', 'soil'))).flatten(); // I checked both images by mapping the ROIs, and they were added successfully
+    //print('tree', tree);
+
+    // Clip out the ROIs to get the actual pixels
+    // var treepixels = image.clip(tree);
+    // var grasspixels = image.clip(grass);
+    // var soilpixels = image.clip(soil);
+ 
+ 
+    //var mcuListMapper = function(x){ // have a switch in this for TGS vs TG
+    var bunchOimages = num_list.map(function(x){
+      // Add the endmembers based on x
+      var listNum = ee.Number(x);
+      // Get the path
+        
+      //  Select the endmember using the current number in the loop as the seed 
+      var treepix = image.sample({numPixels: 1, seed:  listNum, scale: 30, region: tree});//.first().toDictionary().toArray()
+      var grasspix = image.sample({numPixels: 1, seed: listNum, scale: 30, region: grass});//.first().toDictionary().toArray()
+      var soilpix = image.sample({numPixels: 1, seed: listNum, scale: 30, region: soil});//.first().toDictionary().toArray()
+      //print('treepix', treepix)
+      
+      // If the above step resulted in a null endmember (blank), this just sets the seed to 0 and draws that number.
+      // It's unlikely that all of the endmembers will be blank at the same time, so it is also unlikely that this will yield
+      // repeated combinations of endmembers (that is, all three used 0 for their seed at the same time)
+      treepix = ee.Algorithms.If(ee.Number(treepix.size()).eq(0),
+                                  image.sample({numPixels: 1, seed: 0, scale: 30, region: tree}), 
+                                  treepix);
+      grasspix = ee.Algorithms.If(ee.Number(grasspix.size()).eq(0),
+                                  image.sample({numPixels: 1, seed: 0, scale: 30, region: grass}), 
+                                  grasspix);
+      soilpix = ee.Algorithms.If(ee.Number(soilpix.size()).eq(0),
+                                  image.sample({numPixels: 1, seed: 0, scale: 30, region: soil}), 
+                                  soilpix);
+    
+      // Get the band values as a list
+      var treeOnepix = ee.FeatureCollection(treepix).first().toDictionary().toArray().toList();
+      var grassOnepix = ee.FeatureCollection(grasspix).first().toDictionary().toArray().toList();
+      var soilOnepix = ee.FeatureCollection(soilpix).first().toDictionary().toArray().toList();
+      
+      // Unmix (tested this)
+      var oneMCU = ee.Algorithms.If(TGSvalue.length().eq(3),
+        image.unmix([treeOnepix, grassOnepix, soilOnepix], false, false).rename(['tree', 'grass', 'soil']).multiply(1000).toInt(),
+        image.unmix([treeOnepix, grassOnepix], false, false).rename(['tree', 'grass']).multiply(1000).toInt());
+      
+      // This works. To test it, I set the number of replicates lower, then
+      // returned the mean of the image here, so I had a list of MCU interation means in
+      // bunchOimages. All the means were different, meaning the function was working.
+      return oneMCU;//.select(['tree']).reduceRegion({reducer: ee.Reducer.mean(), scale: 90, geometry: main_boundary});
+    });
+      
+    // Map the function across the numbers
+    //var bunchOimages = num_list.map(mcuListMapper);
+    //print('bunchOimages', bunchOimages);
+    
+    // Construct the main name for the bands and image
+    var new_name = ee.String(ee.Algorithms.If(TGSvalue.length().eq(3),
+          name_append.cat('_MCU_TGS'),
+          name_append.cat('_MCU_TG')));
+          
+    // Output the mean of the images 
+    var MCUmean = ee.ImageCollection.fromImages(bunchOimages).reduce({reducer: ee.Reducer.mean(), parallelScale: 4})//.multiply(1000)
+                  .set({'image_name': sysInd}).set({'projection': proj}).set({'unmix_name': new_name});
+                  
+    // Rename the bands based on whether TGS or TG             
+    MCUmean = ee.Algorithms.If(TGSvalue.length().eq(3),
+      MCUmean.rename([new_name.cat('_tree'), new_name.cat('_grass'), new_name.cat('_soil')]),
+      MCUmean.rename([new_name.cat('_tree'), new_name.cat('_grass')]));
+                  
+    // Tested whether the iterations were working by creating lists of different length and then 
+    // seeing if the mean (below) was different.
+    return ee.Image(MCUmean).toInt();//.set({'mean' : MCUmean.select(['tree_mean']).reduceRegion({reducer: ee.Reducer.mean(), scale: 90, geometry: main_boundary})});
+  };
+    
+  // Run the function for TGS
+  var TGSvalue = ee.String("TGS");
+  var MCU_TGS = mcu_col.map(MCUmapper);
+  // Run for TG
+  TGSvalue = ee.String("TG");
+  var MCU_TG = mcu_col.map(MCUmapper);
+  // Put them together 
+  var mcu_collector = MCU_TGS.merge(MCU_TG);
+  //Map.addLayer(mcu_collector.first().select(0));
+  //print(mcu_collector)
+    
+  ///////  SMA  //////////////////////////////////////////////////////////////////////////////////// 
+  // Function to iterate across the images, collecting all the produced SMAs along the way in the 'collector'
+  var SMA_iterator = function(img, collector){
+    // Cast the inputs, just in case 
+    var collect = ee.ImageCollection(collector);
+    var image = ee.Image(img);
+    // print('image', image)
+    
+    // Get the needed properties 
+    var sysInd = ee.String(image.get('system:index'));
+    var name_append = ee.String(image.get('image_selector_4_unmix'));
+    var proj = image.get('projection');
+    var path_iteration = ee.Number(image.get('WRS_PATH'));
+ 
+    //print('path', path_iteration)
+    //print('minPath', mnPath)
+    // Get the ROIs
+    var threeROI = ee.FeatureCollection(allROI.filter(ee.Filter.eq('WRS_PATH', path_iteration)));
+    //print('3ROI', threeROI)
+    var tree = ee.FeatureCollection(threeROI.filter(ee.Filter.eq('Name', 'tree'))).flatten();
+    var grass = ee.FeatureCollection(threeROI.filter(ee.Filter.eq('Name', 'grass'))).flatten();
+    var soil = ee.FeatureCollection(threeROI.filter(ee.Filter.eq('Name', 'soil'))).flatten(); // I checked both images by mapping the ROIs, and they were added successfully
+    //print('tree', tree);
+
+    // Clip out the ROIs to get the actual pixels
+    var treepixels = image.clip(tree);
+    var grasspixels = image.clip(grass);
+    var soilpixels = image.clip(soil); 
+  
+    //////Endmembers
+    // H
+    var mintreeHighEnd = treepixels.reduceRegion({reducer: ee.Reducer.max(), geometry: tree, scale: 30, tileScale: 4}).values();
+    var mingrassHighEnd = grasspixels.reduceRegion({reducer: ee.Reducer.max(), geometry: grass, scale: 30, tileScale: 4}).values();
+    var minsoilHighEnd = soilpixels.reduceRegion({reducer: ee.Reducer.max(), geometry: soil, scale: 30, tileScale: 4}).values();
+   
+    // Median
+    var mintreeMedEnd = treepixels.reduceRegion({reducer: ee.Reducer.median(), geometry: tree, scale: 30, tileScale: 4}).values();
+    var mingrassMedEnd = grasspixels.reduceRegion({reducer: ee.Reducer.median(), geometry: grass, scale: 30, tileScale: 4}).values();
+    var minsoilMedEnd = soilpixels.reduceRegion({reducer: ee.Reducer.median(), geometry: soil, scale: 30, tileScale: 4}).values();
+
+    // L
+    var mintreeLowEnd = treepixels.reduceRegion({reducer: ee.Reducer.min(), geometry: tree, scale: 30, tileScale: 4}).values();
+    var mingrassLowEnd = grasspixels.reduceRegion({reducer: ee.Reducer.min(), geometry: grass, scale: 30, tileScale: 4}).values();
+    var minsoilLowEnd = soilpixels.reduceRegion({reducer: ee.Reducer.min(), geometry: soil, scale: 30, tileScale: 4}).values();
+
+    // Mean
+    var mintreeMeanEnd = treepixels.reduceRegion({reducer: ee.Reducer.mean(), geometry: tree, scale: 30, tileScale: 4}).values();
+    var mingrassMeanEnd = grasspixels.reduceRegion({reducer: ee.Reducer.mean(), geometry: grass, scale: 30, tileScale: 4}).values();          
+    var minsoilMeanEnd = soilpixels.reduceRegion({reducer: ee.Reducer.mean(), geometry: soil, scale: 30, tileScale: 4}).values();
+    
+    // Unmix ///////////////
+    // TGS
+    var min_high_sma = image.unmix([mintreeHighEnd, mingrassHighEnd, minsoilHighEnd], false, false).rename([name_append.cat('_H_all_TGS_tree'), name_append.cat('_H_all_TGS_grass'), name_append.cat('_H_all_TGS_soil')])
+      .multiply(1000).toInt().set({'image_name': sysInd}).set({'unmix_name': name_append.cat('_H_all_TGS')})
+      .set({'projection': proj});
+    var min_med_sma = image.unmix([mintreeMedEnd, mingrassMedEnd, minsoilMedEnd], false, false).rename([name_append.cat('_M_all_TGS_tree'), name_append.cat('_M_all_TGS_grass'), name_append.cat('_M_all_TGS_soil')])
+      .multiply(1000).toInt().set({'image_name': sysInd}).set({'unmix_name': name_append.cat('_M_all_TGS')})
+      .set({'projection': proj});
+    var min_low_sma = image.unmix([mintreeLowEnd, mingrassLowEnd, minsoilLowEnd], false, false).rename([name_append.cat('_L_all_TGS_tree'), name_append.cat('_L_all_TGS_grass'), name_append.cat('_L_all_TGS_soil')])
+      .multiply(1000).toInt().set({'image_name': sysInd}).set({'unmix_name': name_append.cat('_L_all_TGS')})
+      .set({'projection': proj});
+    var min_mean_sma = image.unmix([mintreeMeanEnd, mingrassMeanEnd, minsoilMeanEnd], false, false).rename([name_append.cat('_Mean_all_TGS_tree'), name_append.cat('_Mean_all_TGS_grass'), name_append.cat('_Mean_all_TGS_soil')])
+      .multiply(1000).toInt().set({'image_name': sysInd}).set({'unmix_name': name_append.cat('_Mean_all_TGS')})
+      .set({'projection': proj});
+    // TG
+    var min_high_sma_TG = image.unmix([mintreeHighEnd, mingrassHighEnd], false, false).rename([name_append.cat('_H_all_TG_tree'), name_append.cat('_H_all_TG_grass')])
+      .multiply(1000).toInt().set({'image_name': sysInd}).set({'unmix_name': name_append.cat('_H_all_TG')})
+      .set({'projection': proj});
+    var min_med_sma_TG = image.unmix([mintreeMedEnd, mingrassMedEnd], false, false).rename([name_append.cat('_M_all_TG_tree'), name_append.cat('_M_all_TG_grass')])
+      .multiply(1000).toInt().set({'image_name': sysInd}).set({'unmix_name': name_append.cat('_M_all_TG')})
+      .set({'projection': proj});
+    var min_low_sma_TG = image.unmix([mintreeLowEnd, mingrassLowEnd], false, false).rename([name_append.cat('_L_all_TG_tree'), name_append.cat('_L_all_TG_grass')])
+      .multiply(1000).toInt().set({'image_name': sysInd}).set({'unmix_name': name_append.cat('_L_all_TG')})
+      .set({'projection': proj});
+    var min_mean_sma_TG = image.unmix([mintreeMeanEnd, mingrassMeanEnd], false, false).rename([name_append.cat('_Mean_all_TG_tree'), name_append.cat('_Mean_all_TG_grass')])
+      .multiply(1000).toInt().set({'image_name': sysInd}).set({'unmix_name': name_append.cat('_Mean_all_TG')})
+      .set({'projection': proj});
+
+    
+    // Collect all the images and merge them to the accumulating image collection 
+    var imgCol = ee.ImageCollection.fromImages([min_high_sma, min_med_sma, min_low_sma, min_mean_sma,
+                                                min_high_sma_TG, min_med_sma_TG, min_low_sma_TG, min_mean_sma_TG]);
+    return collect.merge(imgCol);
+  };
+    
+  // Run the function using the same collector as before to add the SMA results
+  mcu_collector = mcu_col.iterate(SMA_iterator, mcu_collector);
+  //print('mcu_collector', mcu_collector)
+
+  // Move mcu_collector over to comp_collection so that this links back up with non-MCU code
+  comp_collection = ee.ImageCollection(mcu_collector);
+}
+//print('comp_collection', comp_collection);
+//Map.addLayer(comp_collection.first().select(0))
+
+
+
+
+
+
+////////////  Extract Point Values  ///////////////////////////////////////////////////////////////////
+if(export_MCU_value_table){
+  
+  // Create an collection with the tree bands for all SMA and MCU
+  var tree_only_col = comp_collection.map(function(img){
+    // Get the tree band, which is the first
+    var image = img.select(0);
+    // Get the band name
+    //var bname = image.bandNames()
+    // Rename the band to 'tree'
+    //var image = image.select(bname , ['tree']).toInt()
+    return ee.Image(image);
+  });
+  
+  // simplemapWname - this could compute an r-squared and VEcv etc and assign them as properties
+  // See if can subtract two columns - can do this, but have to do a map function to get diff and 
+  // assign as a property. See: https://developers.google.com/earth-engine/feature_collection_reducing
+  
+  // Function to get the point values. Will be mapped over the collection 
+  var getPointVals = function(image) {
+    
+    // Change the system:indexes to a combination of the image name and unmix name
+    // Get the names
+    var img_name = ee.String(image.get("image_name"))
+    var unmix_name = ee.String(image.get("unmix_name"))
+    
+    // Remove "minmax_NDVI" from the first and then paste them together
+    img_name = img_name.slice(0, img_name.length().subtract(11))
+    var new_sysIndex = img_name.cat(unmix_name)
+  
+    
+    // Return the table
+    var tr_tbl = ee.Image(image).reduceRegions({
+      collection: gt_points, 
+      reducer: ee.Reducer.first(), 
+      scale: 30
+    });
+    
+    // Assign the image name to the table
+    var trNew = tr_tbl.map(function(pt){
+      pt = pt.set({"name": ee.String(new_sysIndex)});
+      return pt;
+    });
+    return trNew;
+  };
+  
+  // Apply over all images of the collection
+  var pointVal_col = tree_only_col.map(getPointVals).flatten();
+  
+  //var export_name = 
+  ///////////   Export  ///////////////////////////////////////////////////////////////////
+  // Export
+  Export.table.toDrive({
+    collection: pointVal_col,
+    folder: export_folder,
+    description: park_name + "_" + img_unmix + "_" + mcu_models + '_models_GEE_AutoMCUnSMA_pointVals', 
+    fileFormat: 'CSV'
+  });
+
+}
+
+
+
+
+if(export_image){
+  /////////////////  EXPORT  ///////////////////////////////////////////////////////////////////////////
+  // Get a few things for the loop. Need a user side length value to iterate up to.
+  var len = comp_collection.size();
+  print('number of images to export', len);
+  
+  var home_length = len.getInfo();
+  // Convert collection to list for use in loop
+  var colList = comp_collection.toList(len);
+  
+  // Multipart polygons are a problem for the export function, so merge those that are multipart
+  if(park_name == "Tuli" | park_name == "North_South_Luangwa" | park_name == "QWE"){
+    var main_boundary = main_boundary.geometry().bounds();
+  }
+  
+  /////  EXPORT Loop  ////////
+  // Goes through and detects the satellite and gets the crs and transform and exports
+  // using system:index as the name
+  for( var k = 0; k < home_length; k++){
+    
+    // Filter to just the image with the given NDVI min as a property
+    var img2ex = ee.Image(colList.get(k)); // get the image itself
+    //print('img2ex', img2ex);
+  
+    // Get values for export, which are dependent on what we are exporting: Landsat images vs. Unmixing results
+    if(run_MCU){
+      var descrip = img2ex.get('image_name');
+      var home_descrip = descrip.getInfo().slice(0, 28);
+      var suffix = img2ex.get('unmix_name').getInfo();
+      var export_descrip = park_name + '_' + home_descrip + '_' + suffix
+    }else{
+      var descrip = img2ex.get('system:index');
+      var home_descrip = descrip.getInfo();
+      var export_descrip = park_name + '_' + home_descrip 
+    }
+  
+    // Get the crs and transform
+    var home_proj = img2ex.get('projection').getInfo();
+    //print('home_proj', home_proj);
+    var crs_home = home_proj['crs'];
+    var tran_home = home_proj['transform'];
+    //var crs_home = img2ex.get('crs').getInfo();
+    //var tran_home = img2ex.get('transform').getInfo();
+    //print('tran', tran_home);
+    //print('crs', crs_home);
+  
+    // Export
+    Export.image.toDrive({
+      image:  img2ex.toInt(), // NDVI, MSAVI2 and MCU products have been multiplied by 10000 (or 1000 for indices) to allow this conversion to int
+      description: export_descrip,
+      folder: 'Ele_Tree',
+      maxPixels: 10000000000000,
+      region: main_boundary,
+      crs: crs_home,
+      crsTransform:tran_home,
+      //scale: 30
+    });
+  }
+
+}
+
+
+
+
+///// The below worked for point extraction, but were slow or output the data in ways I didn't like
+// // Then extract values
+// var trial = tree_only_col.getRegion({
+//   geometry: gt_points,
+//   scale: 30
+// })
+
+
+// // Then extract values
+// var trial = tree_stack.sampleRegions({
+//   collection: gt_points,
+//   scale: 30
+// }) 
+
+
+// var mapfunc = function(feat) {
+//   var geom = feat.geometry()
+//   var addProp = function(img, f) {
+//     var newf = ee.Feature(f)
+//     var bands = img.bandNames()
+//     var value = img.select(bands)
+//     .reduceRegion(ee.Reducer.first(), geom, 30)
+
+//     var fun = function(name, ini) {
+//       var ini = ee.Feature(ini)
+//       var val = value.get(name)
+     
+//       return ee.Feature(ee.Algorithms.If(val,
+//                         ini.set(name, ee.String(val)),
+//                         ini.set(name, ee.String('No data'))))
+//     }
+
+//     return ee.Feature(bands.iterate(fun, newf)) 
+
+//   }
+//   var newfeat = ee.Feature(tree_only_col.iterate(addProp, feat))
+//   return newfeat
+// };
+
+
+
+// // Map the function across the points 
+// var newft = gt_points.map(mapfunc);
+// //print(newft)
+
+
+// // Put all the images into one image as separate bands
+// // Create empty variable that will be getting bands added to it
+// var empty = ee.Image().select();
+
+// // Put all the bands in one image us the collectBands function written earlier
+// var tree_stack = ee.Image(tree_only_col.iterate(collectBands, empty)); 
+// print(tree_stack);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

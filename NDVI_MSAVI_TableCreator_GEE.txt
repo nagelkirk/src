@@ -1,0 +1,1005 @@
+// GOAL
+// Calculate, plot and export NDVI and MSAVI2 values for parks
+
+////////////  Notes
+// There is no need to mosaic the paths. All you need to do is record their areas and then
+// do a weighted average if you want the average index value for the whole park
+
+// Changing the resolution from 30 meters to 300 changed the mean value by 0.001 (that was
+// consistent across 4 images). Changing the scale was needed, because the code wouldn't run 
+// without the change due to a maxPixel value, which I didn't find a way to change in the chart function 
+// itself (it can normally be changed in a stand alone reduce function)
+
+/////////////////  Functions  //////////////////////////////////////////////////////////////
+// Function will join the properties of the raw landsat LT1 to the SR product
+function carryPROPERTIES(raw, sr, bands1, bands2){
+  // Define an inner join.
+  var innerJoin = ee.Join.inner();
+  // Specify an equals filter for image timestamps.
+  var filterTimeEq = ee.Filter.equals({
+    leftField: 'system:time_start',
+    rightField: 'system:time_start'
+  });
+  // Apply the join. Specify TOA first to get cloud cover metadata
+  var innerJoined = innerJoin.apply(raw, sr, filterTimeEq);
+  // Display the join result: a FeatureCollection.
+  //print(innerJoined); //too slow
+  // Map a function to merge the results in the output FeatureCollection,
+  // then rename the bands from SR back to original names
+  var joined = ee.ImageCollection(innerJoined.map(function(feature) {
+    return ee.Image.cat(feature.get('primary'), feature.get('secondary'))
+      .select(bands1, bands2);
+  }));
+  return joined;
+}
+
+// Function masks clouds. Identifies what is clear skies (<1) and masks all else
+var cloudMask = function(image) {
+  var clouds = image.select(['cfmask']); // BQA for LT1 data
+  return image.updateMask(clouds.lt(1)); // this is where you would set the values to not be masked. Currently only at high confidence of cloud and water (and snow)
+};
+
+// This function gets the number of images listed in 'to_mosaic'
+// It then adds that number as a new field, 'image_num'
+var addNum = function(img) {
+  var oneimg = ee.Image(img);
+  var molist = ee.List(oneimg.get('to_mosaic'));
+  var mergenum = molist.size();
+  return img.set({'image_num': mergenum});
+};
+
+var getNum = function(img, list) {
+  var oneimg = ee.Image(img);
+  var num = oneimg.get('image_num');
+  return ee.List(list).add(num);
+};
+
+var getPath = function(img, list) {
+  var oneimg = ee.Image(img);
+  var num = oneimg.get('WRS_PATH');
+  return ee.List(list).add(num);
+};
+
+//function listYear(collection){
+  //var lst = ee.List([]);
+  
+  //var getYear = function(img, list){
+    //var imgtemp = ee.Image(img);
+    //var yr = imgtemp.get('Year');
+    //var dt = imgtemp.get('DATE_ACQUIRED');
+    //var nMean = imgtemp.get('NDVI_mean');
+    //var mMean = imgtemp.get('MSAVI2_mean');
+    //var nSt = imgtemp.get('NDVI_stdev');
+    //var mSt = imgtemp.get('MSAVI2_stdev');
+    //var path = imgtemp.get('WRS_PATH');
+    //return ee.List(list).add([path, yr, dt, nMean, mMean, nSt, mSt]);
+  //};
+  
+  //var f_lst =  ee.List(collection.iterate(getYear, lst));
+  //return f_lst;
+//}
+
+// Function to calculate the difference between the image date and the driest month (last day of driest month, actually)
+var droughtDIFF = function(img) {
+  var oneimg = ee.Image(img);
+  // Get ymd
+  var dateAcquired = ee.String(oneimg.get('DATE_ACQUIRED'));
+  //print('date_acquired', dateAcquired);
+  // Get year
+  var yearAcquired = ee.String(dateAcquired.slice(0, 4));
+  //print('year_acquired', yearAcquired);
+  // Use year to get row from table for that year
+  var table_row = drought_table.filter(ee.Filter.eq('Year', yearAcquired)).first(); // everything without the .first() part gets a collection consisting of 1 feature, so telling it to take just that first feature
+  //print("table_row", table_row);
+  // Get the drought date for the year
+  var drought_date = ee.Date(table_row.get('Drought_Date'));
+  //print('drought_date', drought_date);
+  // Get days seperating the dates (try to have a sign associated)
+  var diff = ee.Number(drought_date.difference(ee.Date(dateAcquired), 'day')).abs(); // decided to get the abolute difference for now
+  //print("diff", diff);
+  // Assign the difference as a new attribute
+  return img.set({'droughtDiff': diff});
+};
+
+// Function to add year to each image
+var addYEAR = function(img){
+  var oneimg = ee.Image(img);
+  // Get ymd
+  var dateAcquired = ee.String(oneimg.get('DATE_ACQUIRED'));
+  //print('date_acquired', dateAcquired);
+  // Get year
+  var yearAcquired = ee.String(dateAcquired.slice(0, 4));
+  //print('year_acquired', yearAcquired);
+  // Assign the year as a new attribute
+  return img.set({'Year': yearAcquired});
+};
+
+// Function to set 'to_mosaic' to a new value (wrapping in an external function failed for some reason)
+var setPROPERTY = function(img){
+  var newimg = img.set({'to_mosaic': 0});
+  return newimg;
+};
+
+// Function groups images by the discriminator, then pastes them all in new property
+// Annotations aren't totally up to date (discriminator == DATE_ACQUIRED, property = to_mosaic)
+function addFILTER(collection, discriminator, property, delete_to_mosaic){
+  // Gets images with unique dates and collects the first one with that date, it appears
+  // That means that not all the scenes are listed 
+  var distinct_dates = collection.distinct([discriminator]);
+  // Now create a new collection of images with the names listed in distinct_dates
+  var distinct_images = ee.ImageCollection(distinct_dates);
+  
+  // Join collection to itself grouped by date
+  // This will filter images based on their dates (all with same dates grouped together). 
+  // That allows them to be grouped together and mosiacked
+  // This first step simply creates the filter criteria to be used ('DATE_ACQUIRED')
+  var date_eq_filter = ee.Filter.equals({leftField: discriminator,
+                                       rightField: discriminator});
+  //print("date_eq_filter", date_eq_filter);
+  // This step is creating a path for the Join.saveAll function to be used next
+  // and creates the name the list will be assigned: "to_mosaic"
+  var saveall = ee.Join.saveAll(property);
+  //print("saveall", saveall);
+  // If wanted to reset 'to_mosaic', this will set it to 0
+  if(delete_to_mosaic === true){
+    collection = collection.map(setPROPERTY);
+  }
+  // This applies the previous object's function
+  // It joins the distinct images (180 total) to all the original imagery (649 total)
+  // It does the join based on the date using the date_eq_filter
+  // So it's putting together all the images with the same date and grouping
+  // using the distinct_images as the group name
+  var mosaic_dates = saveall.apply(distinct_images, collection, date_eq_filter);
+  return mosaic_dates;
+}
+
+// Function to create a field that is a rank of the image, from closest to farthest from that year's driest month
+function combineRankData(collection1, collection2){
+  var addRANK = function(img){
+    // Get the year of the image
+    var yr = img.get('Year');
+    //print('yr', yr);
+    // Filter the collection by that year and get the first
+    var yr_image = ee.ImageCollection(collection2)
+      .filter(ee.Filter.eq('Year', yr)).first();
+    //print('yr_images', yr_images);
+    // Get the grouped images
+    var group_images = ee.ImageCollection.fromImages(yr_image.get('same_year'));
+    //print('group_images', group_images);
+    // Create a list of the differences
+    var diffs = ee.List(group_images.aggregate_array('droughtDiff'));
+    //print('diffs', diffs);
+    // Sort the list (ascending)
+    var sorted = diffs.sort(); //diffs.arraySort();
+    //print('sorted', sorted);
+    // Find where the current image is in the list (it's rank)
+    // Get it's drought diff
+    var image_dif = img.get('droughtDiff');
+    //print('image_dif', image_dif);
+    // Identify its position in the list
+    var rank = sorted.indexOf(image_dif);
+    //print('rank', rank);
+    // The first element is indexed as 0, so add 1 to make clearer
+    var rank_added = rank.add(1);
+    // Set the rank as a new "rank" property
+    return img.set({'Rank': rank_added});
+  };
+  // Map the addRANK function across the collection provided (collection1)
+  var final_ranked_collection = collection1.map(addRANK);
+  //print('final_ranked_collection', final_ranked_collection);
+  return final_ranked_collection;
+}
+
+// Change the number format of the bands to int16 so they are all the same and can be exported
+function selectImageNcast(collection, image_name){
+  var img = ee.ImageCollection(collection)
+    .filter(ee.Filter.eq('system:index', image_name));
+var img1 = ee.Image(img.first());
+var img2 = img1.int16();
+return img2;
+}
+
+// Function sets the number of images that are in a complete path for all the images/paths in a collection
+var addPathImgMax = function(collection, imageMax){
+    // Start mapped function
+    var addImageMax = function(img){
+      return img.set({'max_images': imageMax});
+    };
+    return collection.map(addImageMax);
+  };
+
+// Function maps across a collection and compares image_num and maxnum (complete path) and creates new property (0/1, 1 if they match)
+var incompletePathDetection = function(collection){
+  var collect = ee.ImageCollection(collection);
+  // Start mapped function
+  var add_image_flag = function(img){
+    var i = ee.Image(img);
+    // Get imagenum
+    var imgnum = ee.Number(i.get('image_num'));
+    // Get maxnum
+    var maxnum = ee.Number(i.get('max_images'));
+    // if they aren't equal, set to 0, else to 1
+    return img.set({'has_complete_path': imgnum.eq(maxnum)});
+  };
+  return collection.map(add_image_flag);
+};
+
+// Function to assign the max possible image number for a path to each image
+var createMaxImagesProperty = function(collection, minPath, maxPath){
+  
+  // Start loop
+  var i = minPath;
+  var temp_collect = collection; // created to be overwritten below
+  
+  for( ; i <= maxPath; i++){
+    // Create collection subset
+    var path_collection = ee.ImageCollection(collection)
+      .filter(ee.Filter.eq('WRS_PATH', i));
+       
+    // Find the maximg  
+    var temp = ee.List([]);
+    var difs =  ee.List(path_collection.iterate(getNum, temp)).sort(); 
+    var imageMax = ee.Number(difs.get(difs.length().subtract(1)));
+       
+    // Set a new property with the max num
+    var collection_withMaxImg = addPathImgMax(path_collection, imageMax);
+    //print('test', collection_withMaxImg);
+    
+    // Assign that stack to an empty collection 
+    if(i == minPath){
+      temp_collect = ee.ImageCollection(collection_withMaxImg);
+    } else {
+      temp_collect = ee.ImageCollection(collection_withMaxImg.merge(temp_collect));
+    }
+  }
+  return temp_collect;
+};
+
+///// Function to mosaic and calculate NDVI and MSAVI2 for the collections
+var landsatMosaicIndexCalc = function(imageCollection, cloudCoverThreshold, boundary, nirBand, redBand){
+  
+  ////STEPS of function (more or less)
+  // For each satellite:
+  // 1. Get all imagery underlying park boundary
+  // 2. Mask clouds and water
+  // 3. Clip out the park
+  // 4. Mosaic based on dates
+  // 5. Calculate NDVI and MSAVI2
+  
+  // They don't have to go into diff paths, because the date is what is used to mosaic them
+  // So can keep as one stack and put all together at the end into one stack, then plot
+  
+  // Mappable clip function 
+  var clipped = function(img){
+    return img.clip(boundary);
+  };
+  
+  var LC8_filtered = ee.ImageCollection(imageCollection)
+    .filterBounds(boundary)
+    .filter(ee.Filter.lt('CLOUD_COVER', cloudCoverThreshold))
+    .map(clipped)
+    .map(cloudMask);
+    
+  print(LC8_filtered);
+    
+  // Define min and max path
+  var minPath = LC8_filtered.aggregate_min("WRS_PATH").getInfo();
+  var maxPath = LC8_filtered.aggregate_max("WRS_PATH").getInfo();
+  print(minPath);
+  print(maxPath);
+  
+  // Run function to add property of images to be mosaicked (they'll have the same date)
+  var LC8_mosaic_dates = addFILTER(LC8_filtered, 'DATE_ACQUIRED', "to_mosaic");
+  
+  // Map the addNum function across all images to create new category with number 
+  // of 'to_mosaic' images 
+  var LC8_newcollection = LC8_mosaic_dates.map(addNum);
+  //print('LC8_newcollection', LC8_newcollection);
+  // Now there is a new to_mosaic property containing a range of number of images
+  // But only want instances with max scenes present, respective to the path (some paths might have fewer than others). 
+  // So below a function helps eliminate those with less than the max number of images 
+  // image_num is the number of scenes still present in that row 
+  
+  // Find the max image_num by iterating through each image in the collection, recording the number of images,
+  // sort that list in ascending order, and take one less than the size of the image collection bc the list
+  // starts numbering at 0, not 1. So the last number of a 10-long list is number 9. Also, there is no max function
+  // for lists, otherwise this could be much shorter. 
+  
+  // The max number of images in each path could be different. For example, there could be 3 max in one row and 2 in another.
+  // So need to account for the row we're looking at when determining the max number of images. 
+  // Splitting the collection is a bad idea (creates too many variables whose number would change with diff parks)
+  
+  // 1. set max number of images for each path as a new property
+  var collection_with_maxImages_property = createMaxImagesProperty(LC8_newcollection, minPath, maxPath);
+  //print(collection_with_maxImages_property);
+  
+  // 2. Run function that compares image_num and maxnum and creates new property (0/1)
+  var collection_with_detection = incompletePathDetection(collection_with_maxImages_property);
+  //print('collection_with_detection', collection_with_detection);
+    
+    
+  // Get only the dates that have the max number of images possible
+  var LC8_complete = ee.ImageCollection(collection_with_detection)
+   .filter(ee.Filter.eq('has_complete_path', 1));
+  //print('LC8_complete', LC8_complete);
+  //var LC8_complete = ee.ImageCollection(LC8_newcollection)
+  // .filter(ee.Filter.eq('image_num', maxImages));
+ 
+ 
+  ///////////  ADD YEAR  ////////////////////////////////////////////////////
+  // Map the year function
+  var LC8_yr = LC8_complete.map(addYEAR);
+  //print('LC8_yr', LC8_yr);
+ 
+ 
+  ///////////////////  MOSAIC  ///////////////////////////////////////////////////////////////////
+  // This creates a variable and has a new function imbedded within the call
+  // The function is easiest read backwards and is mapped across all mosaic_images
+  // The function mosaics images from each element in the 'to_mosaic' list 
+  // (each element has several landsat scenes with the same date),
+  // then creates an image collection from those mosaicked images
+
+  function createMOSAIC(collection){
+    var mosaicked_collection = ee.ImageCollection(collection).map(function(img) {
+      var startTime = img.get('system:time_start');
+      var yr = img.get('Year');
+      var date = img.get('DATE_ACQUIRED');
+      var path = img.get('WRS_PATH');
+      var newCollection = ee.ImageCollection.fromImages(img.get('to_mosaic')).mosaic(); 
+      return newCollection.set({'system:time_start': startTime})
+      .set({'Year': yr})
+      .set({'DATE_ACQUIRED': date})
+      .set({'WRS_PATH': path});
+    });
+    return mosaicked_collection;
+  }
+  
+  // Run the mosaic function 
+  var LC8_path168_mos = createMOSAIC(LC8_yr);
+  //print('LC8_path168_mos', LC8_path168_mos);
+  //var first_mos = ee.Image(LC8_path168_mos.first());
+  //var imgband = first_mos.select('B3');
+  //Map.addLayer(imgband, {}, 'imgband');
+  
+
+  ////////////  5. Calculate NDVI and MSAVI2  //////////////////////////////////////////////////////////
+  // Create the NDVI function 
+  var addNDVI = function(img){
+    var image1 = ee.Image(img);
+    var nir = image1.select(nirBand);
+    var red = image1.select(redBand);
+    var ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+    return image1.addBands(ee.Image(ndvi));
+  };
+
+  // Create the MSAVI2 function (these could be made into functions that take a collection and nirBand and redBand as inputs)
+  var addMSAVI2 = function(img) {
+    var image1 = ee.Image(img);
+    var nir = image1.select(nirBand);
+    var red = image1.select(redBand);
+    // Equation is broken up into parts to make it somewhat easier to follow
+    // Maybe would run just as well using * / ^ and so forth, but decided to use GEE functions in case it's faster
+    var chunk1 = nir.multiply(2).add(1);
+    var chunk2 = chunk1.multiply(chunk1);
+    var chunk3 = nir.subtract(red).multiply(8);
+    var chunk4 = chunk2.subtract(chunk3).sqrt();
+    var msavi2 = chunk1.subtract(chunk4).divide(2).rename('MSAVI2'); 
+    return image1.addBands(msavi2);
+  };
+
+  // Add the NDVI & MSAVI2 bands to the stack
+  var withNDVI = LC8_path168_mos.map(addNDVI);
+  var withNDVI_n_MSAVI2 = withNDVI.map(addMSAVI2); 
+  
+  //print('final', withNDVI_n_MSAVI2);
+  return withNDVI_n_MSAVI2;
+};
+
+// Function to run the NDVI and MSAVI2 Calculation and plot
+var calcINDICES_n_MERGE = function(boundary, cloudcover){
+  
+  // Calc the indices and put them in one stack imageCollection, cloudCoverThreshold, boundary, nirBand, redBand
+  if(park_name == "Chobe" | park_name == "Selous" | park_name == "Ruaha" | 
+  park_name == "North_South_Luangwa" | park_name == "North_Luangwa" | park_name == "South_Luangwa"){
+    var index_LC8 = landsatMosaicIndexCalc(LC8, cloudcover, boundary, 'B5', 'B4');
+    var index_LC7 = landsatMosaicIndexCalc(LC7, cloudcover, boundary, 'B4', 'B3');
+    var index_LC5 = landsatMosaicIndexCalc(LC5, cloudcover, boundary, 'B4', 'B3');
+    //print('index_LC8', index_LC8);
+    // Put all into one collection
+    var m1_50hole = index_LC8.merge(index_LC7);
+    var index_merged = m1_50hole.merge(index_LC5);
+    //print('index merged', index_merged);
+  } else {
+    var index_LC8 = landsatMosaicIndexCalc(LC8, cloudcover, boundary, 'B5', 'B4');
+    var index_LC7 = landsatMosaicIndexCalc(LC7, cloudcover, boundary, 'B4', 'B3');
+    var index_LC5 = landsatMosaicIndexCalc(LC5, cloudcover, boundary, 'B4', 'B3');
+    var index_LC4 = landsatMosaicIndexCalc(LC4, cloudcover, boundary, 'B4', 'B3');
+    //print('index_LC8', index_LC8);
+    // Put all into one collection
+    var m1_50hole = index_LC8.merge(index_LC7);
+    var m2_50hole = m1_50hole.merge(index_LC5);
+    var index_merged = m2_50hole.merge(index_LC4);
+    //print('index merged', index_merged);
+  }
+  return index_merged;
+};
+
+// Function to get the mean & stdev of the indices assigned as a property
+var addMeanINDEX = function(img){
+  var oneimg = ee.Image(img);
+  var ndviband = oneimg.select('NDVI');
+  var msaviband = oneimg.select('MSAVI2');
+    
+  // Reduce the region. The region parameter is the Feature geometry.
+  var ndvi_val = ndviband.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: fiftykmbuffer_shp.geometry(),
+    scale: 300,
+    maxPixels: 1e12
+  });
+    
+  var msavi_val = msaviband.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: fiftykmbuffer_shp.geometry(),
+    scale: 300,
+    maxPixels: 1e12
+  });
+  
+  // use get to pull out the value
+  var n = ndvi_val.get('NDVI');
+  var m = msavi_val.get('MSAVI2');
+  
+  return img.set({'NDVI_mean': n}).set({'MSAVI2_mean': m});
+};
+
+// Function to add a stdev of the indices 
+var addStDevINDEX = function(img){ 
+  var oneimg = ee.Image(img);
+  var ndviband = oneimg.select('NDVI');
+  var msaviband = oneimg.select('MSAVI2');
+    
+  // Reduce the region. The region parameter is the Feature geometry.
+  var ndvi_val = ndviband.reduceRegion({
+    reducer: ee.Reducer.stdDev(),
+    geometry: fiftykmbuffer_shp.geometry(),
+    scale: 300,
+    maxPixels: 1e12
+  });
+    
+  // Reduce the region. The region parameter is the Feature geometry.
+  var msavi_val = msaviband.reduceRegion({
+    reducer: ee.Reducer.stdDev(),
+    geometry: fiftykmbuffer_shp.geometry(),
+    scale: 300,
+    maxPixels: 1e12
+  });
+  
+  // use get to pull out the value
+  var n = ndvi_val.get('NDVI');
+  var m = msavi_val.get('MSAVI2');
+  
+  return img.set({'NDVI_stdev': n}).set({'MSAVI2_stdev': m});
+};
+  
+  
+  
+  
+  
+  
+  
+/////////////////  Variables  ////////////////////////////////////////////////////////
+var park_name = "Mpala";      // "Kruger", "QWE", "North_South_Luangwa", "Kruger_Limpopo", "Chobe", "Limpopo", "Serengeti", "Selous", "Ruaha", "Mara", "Mpala", "QWE", "Murchison", "North_Luangwa", "South_Luangwa"
+var createTable = true;       // Create and export a table of index values for the park?
+var createPlot = false;       // This doesn't work. Should a plot of all the index values be created?
+var stat_to_plot = 'mean';    // Have to finish plot code to use this. Possible values are: 'mean' or 'stdev' (can add more)
+var runscrap = false;         // Keept this at false...it's just scrap code that isn't commented out and could be use later
+var filename = park_name.concat('_NDVI_MSAVI2_stats');  // This will be the file name for the csv
+
+if(park_name == "Selous" | park_name == "Serengeti_Mara" | park_name == "Ruaha" | park_name == "Mpala" | 
+park_name == "Murchison" | park_name == "QWE"){
+  var cloud_cover = 35;  
+} else var cloud_cover = 10;        // What percent does the cloud cover need to be below in the images?
+
+
+////////////////  Automated coded  ///////////////////////////////////////////////////
+// List the bands in each dataset
+var LC8bands1 = ee.List(['B1_1', 'B2_1', 'B3_1','B4_1','B5_1','B6_1','B7_1','cfmask']);
+var LC8bands2 = ee.List(['B1', 'B2', 'B3','B4','B5','B6','B7','cfmask']);
+var LC47bands1 = ee.List(['B1_1', 'B2_1', 'B3_1','B4_1','B5_1','B7_1','cfmask']);
+var LC47bands2 = ee.List(['B1', 'B2', 'B3','B4','B5','B7','cfmask']);
+//print('LC47bands1', LC47bands1);
+//print('LC47bands2', LC47bands2);
+
+
+// Define shapefiles and paths
+// The buffers all start with the park as distance 0 and include all beyond that to the buffer extent
+// That means a 50km buffer has the 20km buffer as a part of it
+// Something to maybe do is do a 30km buffer out from the 20 in order to make the 50km, so 50km and 20km will
+// be separate
+if(park_name == "Kruger"){
+  var mnPath = 168;
+  var mxPath = 169;
+
+  // LOAD FUSION TABLES 
+  // Load boundaries (fusion table) (The others are in my gmail account's drive folder)
+  //There are also fusion table links for the buffers themselves (not donuts / holes)
+  var boundary = ee.FeatureCollection('ft:1JtBMIXQmHqUlQvng9fRGAQOvFcv_2pnsXnXaffCl');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1-a7PqUq_ruIdrRbyUANHumTddRABcrS3JfTD1bpH');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1Ga8HURGDzKWFQQzWQOKpek1x90pkdbToUMrRjSGj');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1IBDCO2Ly_sCyXYLw8btvY2L8h-Zv6Aks6-kn5rT6');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1vwqysa9tuyGDdLHO7FLWL_b2UJWuyeID3Xs1uGpq');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1KCGYRX90TnSGaLEkr8CjO_YiKKvmD-OoIL78RXfu');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1lXXiXC7FAsBvG0tVEgnlA0nA2hz5huSBocwCfeDj');
+  // Display park shapefile
+  //Map.addLayer(kruger_shp, {color: 'FF0000'}, 'colored');
+}
+
+if(park_name == "Kruger_Limpopo"){
+  var mnPath = 167;
+  var mxPath = 169;
+  
+  var boundary = ee.FeatureCollection('ft:1LoUaXZeWmYo-uJ26mFSqpyK13TUaEPkPKwBN0t6J');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1xcuPVRvAS34BglcvXNuWNrBsCxass9LhvqVEKUks');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1TITMFvtB63m9hYVXenPDgLisOOXJS52hVdluqAhp');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1NBk6TPfbVYlidy31F9e2DTwkaBzO48StC-HhYhvJ');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1JZ5c7Bw7ggPqFwycw9_DFReu_5wcQO38rK3n-hbV');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1ySI1_Ko9SyhgBJb8HZahJIIpMnCVsTx3Emn-8eSx');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1lkQ1cbM4ra5odUXOdKZXWy6LAhG6MdvFnBe074ya');
+}
+
+if(park_name == "Chobe"){
+  var mnPath = 173;
+  var mxPath = 174;
+    
+  var boundary = ee.FeatureCollection('ft:15f2DSWA8bQWQDcgCDGtrYMN-RMkaCJR5DeQfnK6b');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1mVIGURS72sOcaWWNoobTtoXWSHTHLiHXmdEyOquf');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1-i3IApOlhB2zXXv6sRbYNXFP0QAcPeM7omvjsHJb');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:19XvZniYlHMRuPuyq8bvRWzo2yPEI27_fYpNpD9Kl');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1qSYX8Vq9rK_xWuU6sNe_T1QVk18aYmsDuPVURW3y');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1-i3IApOlhB2zXXv6sRbYNXFP0QAcPeM7omvjsHJb');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1URtTIhzVaHFoC_8NRB3Gey3dkWHnnlqmNhnwlN5f');
+  //var chobe_100kmBuffer_shp = ee.FeatureCollection('ft:1xZTTXQVTvx7VCput7tEmqH5HFntslby6jbivbK7T');
+}
+
+if(park_name == "Serengeti_Mara"){
+  var mnPath = 169;
+  var mxPath = 170;
+    
+  var boundary = ee.FeatureCollection('ft:19qyB9900-C3yqE4eKhapRvffTQca6yKEt3914SGd');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1LROE3e-ag4jIvtuDXXlZdHwf-JWKIYxeisI0pQo0');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1XALWpUWk_UBLRsdfL54_qUmzoXxYIkrb0k094FY-');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1AR0C0H6jkJ-tIinQoxt0dZLtuiIknx1y4ac08UB2');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1bxLTex8JZNuOGpKGnywVlOfy9qkC80n3ahsw4eUx');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1vsoC9JWDVGDwh-u-cK7HTCM5QBvYVrPqJkcwjyzQ');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1sI_jRHRLvEpNFs9B5M-wTOxkPKrpDq8VSf4id5C4');
+  //var serengetiMara_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1QteNVXeR48WdSxXRcrcjxaIftXVI3zwCXBaVTUBr');
+}
+
+if(park_name == "Serengeti"){
+  var mnPath = 169;
+  var mxPath = 170;
+    
+  var boundary = ee.FeatureCollection('ft:1w9ZlY4vaBEp8D06d3p_4vjmzCuUOJpGTOvpRcrOg');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1FhhY6ZH8_067zZwgXsvNrc4pb4u8oyPqrCdCcr3C');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:121UY1rbW3as7VZW_ldmSJA93i2RMAzqs49-zIpAn');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:19S6QU2I_Y0oK-Y2FeI0AM4q5GcozVIrCOxiddRSr');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1Gr18xEhcQkzvLz7kqhMWC5wQbVVs0rplERcg4tKg');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1y_rlT__qs3Reg3d8z3ST74NWYCxKkgTtMeg5bm0n');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1nxuEAmxSJOEshmioVNXX7xwQP_R6GxD012v9yASy');
+}
+
+if(park_name == "Mara"){
+  var mnPath = 169;
+  var mxPath = 170;
+    
+  var boundary = ee.FeatureCollection('ft:1es_-JK9tLvRAoO4zSqP7hqmCGaBw7S9PDQcXheRR');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:10KZZgWh0o2qpDw1Ex8jTGprJnLxnkSoxtqjucu4L');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:10O-L7LeDhxrgIMVEUkhAfNbrN5U_SX9g8L7gZLVJ');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1ASQVb3CRwEomxP9MEJsUkBl1FdLAH-iIAYeFeXzE');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1AP4aF_wTa5KOHlQxyAXzIcqCJyhdOOXsCp_jAtf5');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1pH72d5wzRVuKi96jevqnbdfRss09wnegU2wuuzgQ');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1OxXfGadyPegLl0gx4tQoZL80Wf3xCaQQxlCELPwD');
+}
+
+if(park_name == "Limpopo"){
+  var mnPath = 167;
+  var mxPath = 169;
+  
+  var boundary = ee.FeatureCollection('ft:1CqDt7vRnKQzcK1H3RCIPDoHYi4V1F_Uxm3Pn7tQB');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1h3S1rfa3T9WmO0SBgbtzCGwNaiUT0i9Wn0KKD3nf');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1vv4TqG0U31NpXRQ0oesg4lJ_BZO6pDq5kdVjhuCJ');    
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1noERpEVcjhxf0_l331buVTdFIrWM94ou2fwyShU0');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:165CObd5ua3pMx-VzGUJBchuusoGmn_lFBoZD20wY');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1-I9OSNRHL0ZV-_YWm5rfpgBF7hY41D9Bva44VjUo');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1S7K7h7Zw56mhLUmsTWSs5x02vU1MoaBybTX9GCKk');
+  //var limpopo_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1CROHVuksufJDpg5kdQekNymYsaQCwf6aXw9rRfTP');
+}
+
+if(park_name == "Selous"){
+  var mnPath = 166;
+  var mxPath = 168;
+  
+  var boundary = ee.FeatureCollection('ft:1RKBrEwD1Pbh02vlXSWfo6FtZI4cFJSIIFnP3DWVL');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:180Ro9ATS5xe8QMWWFbQrIWK3YGwDTgWp5STjR43-');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1MSWpYM13AjHlZGJr8Md70Bttk1nLbIpggex-HrUm');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:15uMmUBdQ5PxVMLvHhp28hzH0wKR_bvJT-rRNReUh');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1CGN2wzlOvfIttPTD1al5fU_l0Zs0bleU6NYUjlD_');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1S_3tBH2f89kY-U2NY2iY7b4Rt-g5Qrowfub70su7');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1a-XhqYbn7qJLg9naJMOx_bMdzXP4psRoXlagSkHB');
+  //var selous_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1eSCHuWO8bAQQuO7XWAbHnF_foPkYobMbCuB2DyDt');
+}
+
+if(park_name == "Ruaha"){
+  var mnPath = 168;
+  var mxPath = 170;
+  
+  var boundary = ee.FeatureCollection('ft:1554Z5uvjb6PBBTZbrmAtcmE5NQVZoQ6hZgR3Vjen');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:15P2t0IxFa5eB-GEoJyBA7x4KBcMVkfqu6eB_ufh-');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1KaVRQYNoKNJ-b6ZoR3RBZhT8RSayEkenFwdJXc3v');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1jFLXnlsgGLdRw6fjpW3a1CSppWXoDNc7Pz8z3GCM');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1PgG02LZEW1gBoGzbEpadhUMnFbRt2CzslE3_f2LN');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1AnUe7aYpOfuFvgB2Hxpj4JiOi31qRICiKl2yHqUd');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1_n5svsTr8sE2GptEwO-1pAkpIINfnWoqQcVzH4Ht');
+  //var ruaha_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1i2GynVlv6saYJ3A6hRZNY7uG-A-YLdAD9KIMkgYC');
+}
+
+if(park_name == "QWE"){
+  var mnPath = 172;
+  var mxPath = 173;
+  
+  var boundary = ee.FeatureCollection('ft:1eiS83sX4VnynxpqWvxqz1rMmxv85MdQDUjhwDCSr');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1sCronmvrU3-g8S0yQV6bA3fCtNg1cBSEJMgB34HO');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1neLQJ_2Z7i7STpfQEDNli9nDAAmFXVb9nCv6Kq0p');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1WCG2RIcrFUnVvMLc1wRJqoX80OKYp9Klb3TLZUJL');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:13lS6CBDXClQge9-SqkLh-rIZr0jwjmgw7tm2vOZ2');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1k2KR4TrwbypuVcpgKl1AIFJto_Acm1QaUdiT-Xv-');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1sn0ni-W6se1tk0v9mP36pUH7EWfq_T2D2qc1L1Se');
+  //var qwe_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1po_hqxG6NaBsOoL88CCqlvbEoAdU-trqea-dLCzO');
+  
+  // Display park shapefile
+  //Map.addLayer(boundary, {color: 'FF0000'}, 'colored');
+}
+
+if(park_name == "Murchison"){
+  var mnPath = 171;
+  var mxPath = 172;
+  
+  var boundary = ee.FeatureCollection('ft:1NOQ_uLw93IpRKWFnoxL-3lylAbtIiekwC8hx5YdS');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1aRx31xmoxcZ-YMeUGCaMxnrqvwcnKvhBzMSalSqO');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1Fl1JY_rWpLQ6rKx4rmFmW063VVc3nJKO21UFdOyx');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1xaMIqcP3Wn5Ia0e18DUVDgGIM5khBMfASzRqPlpB');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1Y8KPaL1A4lKNYdE4VEzK_S35ykGaM4XAEuf3GxHV');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1Bzgm1WK-9ukA_K8j5js1jlxWPoFAoooA5CVvhT6N');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1t_bFpNbCqpbUnqmyA-FJibhwW4PMmVVacI_TPBwn');
+  //var murchison_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1BdwKYd42rqOZOS2NkHBsT31wM0R-uc6Bg4ozPvI-');
+}
+
+if(park_name == "North_South_Luangwa"){
+  var mnPath = 169; // Actually...it would be better to have these split up for this code. It's the imagery retrieval code that should have them together (for MESMA endmembers)
+  var mxPath = 170; // Limpopo and Kruger are another two that could be combined for the MESMA
+  
+  var boundary = ee.FeatureCollection('ft:1Q6goDCMeJKA5M5UALtLXbKzD0GQOKU6qw0QqNjbr');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1GSsndcilRblXcZXONjqtMMpohmdYHkY8TeWws98v');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1e6Il9z-aGpFRiGL8reoz4gE33n3h2EkRFWDVB3HJ');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1CJvBUBsg3tXQVXadtW8cVKq_xAfyX1B6G6iyFXJq');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1MYEkfFQXwB2k8M3kse_gUO_1o2WGKPXn0Scr1_R9');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1YgNxIevB-9WrweFotyEWGaXhRHb8tmBCt4UMn5-f');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1xe1H_mXi3nurVJZGcPUif-Yuohab7y5zDmxuqFNV');
+  //var north_south_luangwa_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1mdkJmfeV4luMGiKD0GNdQITGitCXZrsOOFDJwStk');
+}
+
+if(park_name == "Mpala"){
+  var mnPath = 168;
+  var mxPath = 169;
+  
+  var boundary = ee.FeatureCollection('ft:1M1xIOuqKPOSyiHsAbk1lfN0W5j2mJvSTJg7g9UEc');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1H3oTA7KRiIS0QexderuJb5nY9SImtpGP4LMq8Lj8');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1GvgXbszvTxMH5aZep6bJr5NJ2GXHaNG0Dls2_Z86');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:16wS4hAPhQ2GMCHwsFnqtvMANYnaYDlKGnCgn6Qzi');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1283nQ-USEWsAL00ng_Cx_hcExmROCuTZqxZL_fnT');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1ltOZMba8l4_jOPw6Jw7ebMpp3vfdH5K6xLCYpP2i');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1FJE6Y41AtXEKLD8JwhI81A8fwCyDc7_2qN9PRXq4');
+  //var mpala_100kmbuffer_hole_shp = ee.FeatureCollection('ft:19gXljL-qSm5yIO96YAEL_iANlDROugZEWvJiXFa9');
+}
+
+if(park_name == "North_Luangwa"){
+  var mnPath = 169;
+  var mxPath = 170;
+  
+  var boundary = ee.FeatureCollection('ft:1Lmb4JlcxZObLTTgg79coI9xpU9Nl8eRgx-810tiZ');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:18lqu7oX1n8yzg9taDBGV6KBIU5yOyF_tCIMPPXsj');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1-qmSEVa-6uoU6IG2a2OgIaaLjY_VOCC043ANkOcc');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1AJb3r48swPMAVYZZqak-KGEWK2hE66BXjita7pbg');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1BPyTsftBVIt9zBztMyrjwdiiqozztEftLfVuKNHt');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1CRxkrKYKmBixris7AAWDhz9N_X-EAvhzUSTthkbw');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:10y6xTifXYVqLzYeQLGxOjbno6NAaA0XMQ_DbJR4y');
+  //var north_luangwa_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1hUAmmKqu1vzTdmp0uHgocTaVSHqxY73f6Aab0EmU');
+  
+  // Display park shapefile
+  //Map.addLayer(neg_1kmbuffer_hole_shp, {color: 'FF0000'}, 'colored');
+}
+
+if(park_name == "South_Luangwa"){
+  var mnPath = 169;
+  var mxPath = 170; // Should put north and south together since in the same path and could share endmembers
+  
+  var boundary = ee.FeatureCollection('ft:1tSe63wg4Jc_4-1RpAJLUhUlzo-9kt83PSPVwd0SP');
+  var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1YVEeacpmxUPZTCn34TG0P3xoyGVTZctXl937UfC_');
+  var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:1efsv7MZBr4dlmXAWtk_ChiqKNm7NZn8vCbJk2kYS');
+  var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:1axsPdCSc3pteqso9rN75PzzEAMC4JbTN7_9_RUIm');
+  var twentykmbuffer_shp = ee.FeatureCollection('ft:1OTvAbyiG1BZgadKAs-ukq0MJqU-DHhVoMrs88PNO');
+  var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:1HOyTEqfSJG8oBGgBpys4Ci_K5rI0DLjbPJbG78f6');
+  var fiftykmbuffer_shp = ee.FeatureCollection('ft:1T0MstQ90pSnz1rdZe0e7gl_37wg-PGMQIVeDFsJ7');
+  //var south_luangwa_100kmbuffer_hole_shp = ee.FeatureCollection('ft:1Ck-DFa5w7RWBK6w64_wzOKOkXcR6W03jAXXYZW6h');
+}
+
+//if(park_name == ""){
+  //var mnPath = ;
+  //var mxPath = ;
+  
+  //var boundary = ee.FeatureCollection('ft:');
+  //var pos_1kmbuffer_hole_shp = ee.FeatureCollection('ft:');
+  //var neg_1kmbuffer_hole_shp = ee.FeatureCollection('ft:');
+  //var twentykmbuffer_hole_shp = ee.FeatureCollection('ft:');
+  //var twentykmbuffer_shp = ee.FeatureCollection('ft:');
+  //var fiftykmbuffer_hole_shp = ee.FeatureCollection('ft:');
+  //var _100kmbuffer_hole_shp = ee.FeatureCollection('ft:');
+//}
+
+
+// Get all the Landsat images for the different satellites
+// Need both LT1 and SR, so can pull properties from LT1 ('DATE_ACQUIRED', etc.)
+// Could apply the cloud threshold here so that all the same images used each time
+// That is discussed more down below where the indices are calculated
+var LC8_sr = ee.ImageCollection('LANDSAT/LC8_SR')
+  .filter(ee.Filter.rangeContains('WRS_PATH',  mnPath, mxPath)); // limit paths to Africa's extent
+var LC8_raw = ee.ImageCollection('LANDSAT/LC8_L1T')
+  .filter(ee.Filter.rangeContains('WRS_PATH',  mnPath, mxPath));
+var LC7_sr = ee.ImageCollection('LANDSAT/LE7_SR')
+  .filter(ee.Filter.rangeContains('WRS_PATH',  mnPath, mxPath));
+var LC7_raw = ee.ImageCollection('LANDSAT/LE7_L1T')
+  .filter(ee.Filter.rangeContains('WRS_PATH',  mnPath, mxPath));
+var LC5_sr = ee.ImageCollection('LANDSAT/LT5_SR')
+  .filter(ee.Filter.rangeContains('WRS_PATH',  mnPath, mxPath));
+var LC5_raw = ee.ImageCollection('LANDSAT/LT5_L1T')
+  .filter(ee.Filter.rangeContains('WRS_PATH',  mnPath, mxPath));
+var LC4_sr = ee.ImageCollection('LANDSAT/LT4_SR')
+  .filter(ee.Filter.rangeContains('WRS_PATH',  mnPath, mxPath));
+var LC4_raw = ee.ImageCollection('LANDSAT/LT4_L1T')
+  .filter(ee.Filter.rangeContains('WRS_PATH',  mnPath, mxPath));
+  
+// Look at first image
+//var LC8one = ee.Image(LC8_sr.first());
+//var LC8one = LC8one.int16();
+//print("LC8one", LC8one);
+Map.centerObject(boundary);
+Map.addLayer(boundary, {}, 'boundary');
+
+
+///////////  CARRY L1T PROPERTIES OVER TO SR  //////////////////////////////////////////////////////
+var LC8 = carryPROPERTIES(LC8_raw, LC8_sr, LC8bands1, LC8bands2);
+var LC7 = carryPROPERTIES(LC7_raw, LC7_sr, LC47bands1, LC47bands2);
+var LC5 = carryPROPERTIES(LC5_raw, LC5_sr, LC47bands1, LC47bands2);
+var LC4 = carryPROPERTIES(LC4_raw, LC4_sr, LC47bands1, LC47bands2);
+
+
+// Calculuate Indices (will be image collections)
+var indx1 = calcINDICES_n_MERGE(boundary, cloud_cover);
+var indx2 = calcINDICES_n_MERGE(pos_1kmbuffer_hole_shp,  cloud_cover);
+var indx3 = calcINDICES_n_MERGE(neg_1kmbuffer_hole_shp, cloud_cover);
+var indx4 = calcINDICES_n_MERGE(twentykmbuffer_hole_shp, cloud_cover);
+var indx5 = calcINDICES_n_MERGE(twentykmbuffer_shp, cloud_cover);
+var indx6 = calcINDICES_n_MERGE(fiftykmbuffer_hole_shp, cloud_cover);
+var indx7 = calcINDICES_n_MERGE(fiftykmbuffer_shp, cloud_cover);
+print(indx3);
+
+// Assign the park name and the boundary used to create the data
+var indx1_named = indx1.map(function(image){
+  return image.set({'Park': park_name}).set({'Boundary': 'park_boundary'});
+});
+var indx2_named = indx2.map(function(image){
+  return image.set({'Park': park_name}).set({'Boundary': 'pos_1kmbuffer_hole_shp'});
+});
+var indx3_named = indx3.map(function(image){
+  return image.set({'Park': park_name}).set({'Boundary': 'neg_1kmbuffer_hole_shp'});
+});
+var indx4_named = indx4.map(function(image){
+  return image.set({'Park': park_name}).set({'Boundary': '20kmbuffer_hole_shp'});
+});
+var indx5_named = indx5.map(function(image){
+  return image.set({'Park': park_name}).set({'Boundary': '20kmbuffer_shp'});
+});
+var indx6_named = indx6.map(function(image){
+  return image.set({'Park': park_name}).set({'Boundary': '50kmbuffer_hole_shp'});
+});
+var indx7_named = indx7.map(function(image){
+  return image.set({'Park': park_name}).set({'Boundary': '50kmbuffer_shp'});
+});
+//print(indx7_named);
+
+// Add to map
+// Plotted all the diff indx collections and all look good
+// But don't know why some have diff number of images
+// Probably because cloud cover is calculated for each shapefile
+// That means ones with small areas are more likely to have more cloud cover
+// Going to keep it that way for now, but could change by moving the cloud 
+// threshold to the lines that get the collections 
+//var first_mos = ee.Image(indx1.first());
+//var imgband = first_mos.select('B3');
+//Map.addLayer(imgband, {}, 'imgband');
+
+
+// Put all into one collection // I think you can't do this because you do the mean over an area that is different for each
+var m1 = indx1_named.merge(indx2_named); // These will need image names in the collections to reflect the boundary used to produce them
+var m2 = m1.merge(indx3_named);
+var m3 = m2.merge(indx4_named);
+var m4 = m3.merge(indx5_named);
+var m5 = m4.merge(indx6_named);
+var m6 = m5.merge(indx7_named);
+//print('m6', m1);
+
+// Get the mean and stdev of the rasters added as properties
+var col_w_mean = m6.map(addMeanINDEX);
+var col_w_mean_n_stdev = col_w_mean.map(addStDevINDEX);
+//print('col_w_mean_n_stdev', col_w_mean_n_stdev);
+
+
+///////////   Export  ///////////////////////////////////////////////////////////////////
+if(createTable === true){
+  // Export
+  Export.table.toDrive({
+    collection: col_w_mean_n_stdev,
+    folder: 'My Drive',
+    description: filename, 
+    fileFormat: 'CSV'
+  });
+}
+
+
+
+// This needs to be modified if want to use (needs to have titles assigned up above for each park)
+// The names could be concatenated using park_name, a list of shapefile modifiers, and the Mean NDVI etc directly below
+if(createPlot === true){
+  // Set the statistic to calculate and the title text 
+  if (stat_to_plot == 'mean'){
+    var summary_stat = ee.Reducer.mean();
+    var main_title1 = title.concat(': Mean NDVI');
+    var main_title2 = title.concat(': Mean MSAVI2');
+  } else if (stat_to_plot == 'stdev'){
+    var summary_stat = ee.Reducer.stdDev();
+    var main_title1 = title.concat(': NDVI Standard Deviation');
+    var main_title2 = title.concat(': MSAVI2 Standard Deviation');
+  }
+  
+  // Only plot if that functionality is turned on
+  // this needs to be changed to distinguish between the boundaries that were used to create the data
+  // It also has to pull the plotting values from the properties, rather than calculating them all again.
+  // Print the graphs     
+  print(ui.Chart.image.series(ee.ImageCollection(col_w_mean_n_stdev).select(['NDVI']), boundary, summary_stat, 300)
+  .setOptions({title: main_title1, vAxis: {title: 'NDVI'}, hAxis: {title: 'Date'}}));
+  print(ui.Chart.image.series(ee.ImageCollection(col_w_mean_n_stdev).select(['MSAVI2']), boundary, summary_stat, 300)
+  .setOptions({title: main_title2, vAxis: {title: 'MSAVI2'}, hAxis: {title: 'Date'}}));
+}
+
+
+
+
+
+// if does work
+// 1. add property that says the shapefile that was used (have this no matter what. also set the park name as a column)
+// 2. run for each park
+ 
+
+// assign park name and shape name
+
+
+
+
+
+
+
+// Try moving the function to the top once you're done. It might not run because it might need the LC8 and all to be defined already
+// Function to run the entire script and generate charts for all of a park's specific boundaries and buffers
+
+
+
+// Create the naming lists
+
+
+if(runscrap === true){
+    var indx1 = calcIndices_n_PLOT(kruger_shp, mnPath, mxPath, stat, 'Kruger National Park', cloud_cover, createTable, createPlot);
+    var indx2 = calcIndices_n_PLOT(kruger_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Kruger National Park 1km Buffer', cloud_cover, createTable, createPlot);
+    var indx3 = calcIndices_n_PLOT(kruger_neg_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Kruger National Park 1km Buffer inside Park', cloud_cover, createTable, createPlot);
+    var indx4 = calcIndices_n_PLOT(kruger_20kmbuffer_shp, mnPath, mxPath, stat, 'Kruger National Park 20km Buffer + Park', cloud_cover, createTable, createPlot);
+    var indx5 = calcIndices_n_PLOT(kruger_20kmbuffer_hole_shp, mnPath, mxPath, stat, 'Kruger National Park 20km Buffer', cloud_cover, createTable, createPlot);
+    var indx6 = calcIndices_n_PLOT(kruger_50kmbuffer_hole_shp, mnPath, mxPath, stat, 'Kruger National Park 50km Buffer', cloud_cover, createTable, createPlot);
+    
+    calcIndices_n_PLOT(chobe_shp, mnPath, mxPath, stat, 'Chobe National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(chobe_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Chobe National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(chobe_neg_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Chobe National Park 1km Buffer inside Park', cloud_cover);
+    calcIndices_n_PLOT(chobe_20kmbuffer_shp, mnPath, mxPath, stat, 'Chobe National Park 20km Buffer + Park', cloud_cover);
+    calcIndices_n_PLOT(chobe_20kmbuffer_hole_shp, mnPath, mxPath, stat, 'Chobe National Park 20km Buffer', cloud_cover);
+    calcIndices_n_PLOT(chobe_50kmbuffer_hole_shp, mnPath, mxPath, stat, 'Chobe National Park 50km Buffer', cloud_cover); 
+
+    calcIndices_n_PLOT(serengetiMara_shp, mnPath, mxPath, stat, 'Serengeti-Mara Ecosystem 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(serengetiMara_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Serengeti-Mara Ecosystem 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(serengetiMara_neg_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Serengeti-Mara Ecosystem 1km Buffer inside Park', cloud_cover);
+    calcIndices_n_PLOT(serengetiMara_20kmbuffer_shp, mnPath, mxPath, stat, 'Serengeti-Mara Ecosystem 20km Buffer + Park', cloud_cover);
+    calcIndices_n_PLOT(serengetiMara_20kmbuffer_hole_shp, mnPath, mxPath, stat, 'Serengeti-Mara Ecosystem 20km Buffer', cloud_cover);
+    calcIndices_n_PLOT(serengetiMara_50kmbuffer_hole_shp, mnPath, mxPath, stat, 'Serengeti-Mara Ecosystem 50km Buffer', cloud_cover);
+
+    calcIndices_n_PLOT(limpopo_shp, mnPath, mxPath, stat, 'Limpopo National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(limpopo_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Limpopo National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(limpopo_neg_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Limpopo National Park 1km Buffer inside Park', cloud_cover);
+    calcIndices_n_PLOT(limpopo_20kmbuffer_shp, mnPath, mxPath, stat, 'Limpopo National Park 20km Buffer + Park', cloud_cover);
+    calcIndices_n_PLOT(limpopo_20kmbuffer_hole_shp, mnPath, mxPath, stat, 'Limpopo National Park 20km Buffer', cloud_cover);
+    calcIndices_n_PLOT(limpopo_50kmbuffer_hole_shp, mnPath, mxPath, stat, 'Limpopo National Park 50km Buffer', cloud_cover);
+  
+    calcIndices_n_PLOT(selous_shp, mnPath, mxPath, stat, 'Selous National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(selous_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Selous National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(selous_neg_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Selous National Park 1km Buffer inside Park', cloud_cover);
+    calcIndices_n_PLOT(selous_20kmbuffer_shp, mnPath, mxPath, stat, 'Selous National Park 20km Buffer + Park', cloud_cover);
+    calcIndices_n_PLOT(selous_20kmbuffer_hole_shp, mnPath, mxPath, stat, 'Selous National Park 20km Buffer', cloud_cover);
+    calcIndices_n_PLOT(selous_50kmbuffer_hole_shp, mnPath, mxPath, stat, 'Selous National Park 50km Buffer', cloud_cover);
+  
+    calcIndices_n_PLOT(ruaha_shp, mnPath, mxPath, stat, 'Ruaha National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(ruaha_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Ruaha National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(ruaha_neg_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Ruaha National Park 1km Buffer inside Park', cloud_cover);
+    calcIndices_n_PLOT(ruaha_20kmbuffer_shp, mnPath, mxPath, stat, 'Ruaha National Park 20km Buffer + Park', cloud_cover);
+    calcIndices_n_PLOT(ruaha_20kmbuffer_hole_shp, mnPath, mxPath, stat, 'Ruaha National Park 20km Buffer', cloud_cover);
+    calcIndices_n_PLOT(ruaha_50kmbuffer_hole_shp, mnPath, mxPath, stat, 'Ruaha National Park 50km Buffer', cloud_cover);
+
+    calcIndices_n_PLOT(qwe_shp, mnPath, mxPath, stat, 'Queen Elizabeth National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(qwe_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Queen Elizabeth National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(qwe_neg_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Queen Elizabeth National Park 1km Buffer inside Park', cloud_cover);
+    calcIndices_n_PLOT(qwe_20kmbuffer_shp, mnPath, mxPath, stat, 'Queen Elizabeth National Park 20km Buffer + Park', cloud_cover);
+    calcIndices_n_PLOT(qwe_20kmbuffer_hole_shp, mnPath, mxPath, stat, 'Queen Elizabeth National Park 20km Buffer', cloud_cover);
+    calcIndices_n_PLOT(qwe_50kmbuffer_hole_shp, mnPath, mxPath, stat, 'Queen Elizabeth National Park 50km Buffer', cloud_cover);
+
+    calcIndices_n_PLOT(murchison_shp, mnPath, mxPath, stat, 'Murchison National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(murchison_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Murchison National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(murchison_neg_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Murchison National Park 1km Buffer inside Park', cloud_cover);
+    calcIndices_n_PLOT(murchison_20kmbuffer_shp, mnPath, mxPath, stat, 'Murchison National Park 20km Buffer + Park', cloud_cover);
+    calcIndices_n_PLOT(murchison_20kmbuffer_hole_shp, mnPath, mxPath, stat, 'Murchison National Park 20km Buffer', cloud_cover);
+    calcIndices_n_PLOT(murchison_50kmbuffer_hole_shp, mnPath, mxPath, stat, 'Murchison National Park 50km Buffer', cloud_cover);
+  
+    calcIndices_n_PLOT(north_south_luangwa_shp, mnPath, mxPath, stat, 'North & South Luangwa National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(north_south_luangwa_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'North & South Luangwa National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(north_south_luangwa_neg_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'North & South Luangwa National Park 1km Buffer inside Park', cloud_cover);
+    calcIndices_n_PLOT(north_south_luangwa_20kmbuffer_shp, mnPath, mxPath, stat, 'North & South Luangwa National Park 20km Buffer + Park', cloud_cover);
+    calcIndices_n_PLOT(north_south_luangwa_20kmbuffer_hole_shp, mnPath, mxPath, stat, 'North & South Luangwa National Park 20km Buffer', cloud_cover);
+    calcIndices_n_PLOT(north_south_luangwa_50kmbuffer_hole_shp, mnPath, mxPath, stat, 'North & South Luangwa National Park 50km Buffer', cloud_cover);
+  
+    calcIndices_n_PLOT(mpala_shp, mnPath, mxPath, stat, 'Mpala Research Centre 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(mpala_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Mpala Research Centre 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(mpala_neg_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Mpala Research Centre 1km Buffer inside Park', cloud_cover);
+    calcIndices_n_PLOT(mpala_20kmbuffer_shp, mnPath, mxPath, stat, 'Mpala Research Centre 20km Buffer + Park', cloud_cover);
+    calcIndices_n_PLOT(mpala_20kmbuffer_hole_shp, mnPath, mxPath, stat, 'Mpala Research Centre 20km Buffer', cloud_cover);
+    calcIndices_n_PLOT(mpala_50kmbuffer_hole_shp, mnPath, mxPath, stat, 'Mpala Research Centre 50km Buffer', cloud_cover);
+  
+    calcIndices_n_PLOT(north_luangwa_shp, mnPath, mxPath, stat, 'North Luangwa National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(north_luangwa_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'North Luangwa National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(north_luangwa_neg_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'North Luangwa National Park 1km Buffer inside Park', cloud_cover);
+    calcIndices_n_PLOT(north_luangwa_20kmbuffer_shp, mnPath, mxPath, stat, 'North Luangwa National Park 20km Buffer + Park', cloud_cover);
+    calcIndices_n_PLOT(north_luangwa_20kmbuffer_hole_shp, mnPath, mxPath, stat, 'North Luangwa National Park 20km Buffer', cloud_cover);
+    calcIndices_n_PLOT(north_luangwa_50kmbuffer_hole_shp, mnPath, mxPath, stat, 'North Luangwa National Park 50km Buffer', cloud_cover);
+  
+    calcIndices_n_PLOT(south_luangwa_shp, mnPath, mxPath, stat, 'South Luangwa National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(south_luangwa_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'South Luangwa National Park 1km Buffer', cloud_cover);
+    calcIndices_n_PLOT(south_luangwa_neg_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'South Luangwa National Park 1km Buffer inside Park', cloud_cover);
+    calcIndices_n_PLOT(south_luangwa_20kmbuffer_shp, mnPath, mxPath, stat, 'South Luangwa National Park 20km Buffer + Park', cloud_cover);
+    calcIndices_n_PLOT(south_luangwa_20kmbuffer_hole_shp, mnPath, mxPath, stat, 'South Luangwa National Park 20km Buffer', cloud_cover);
+    calcIndices_n_PLOT(south_luangwa_50kmbuffer_hole_shp, mnPath, mxPath, stat, 'South Luangwa National Park 50km Buffer', cloud_cover);
+  
+    //calcIndices_n_PLOT(_shp, mnPath, mxPath, stat, 'Chobe National Park 1km Buffer', cloud_cover);
+    //calcIndices_n_PLOT(_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Chobe National Park 1km Buffer', cloud_cover);
+    //calcIndices_n_PLOT(_neg_1kmbuffer_hole_shp, mnPath, mxPath, stat, 'Chobe National Park 1km Buffer inside Park', cloud_cover);
+    //calcIndices_n_PLOT(_20kmbuffer_shp, mnPath, mxPath, stat, 'Chobe National Park 20km Buffer + Park', cloud_cover);
+    //calcIndices_n_PLOT(_20kmbuffer_hole_shp, mnPath, mxPath, stat, 'Chobe National Park 20km Buffer', cloud_cover);
+    //calcIndices_n_PLOT(_50kmbuffer_hole_shp, mnPath, mxPath, stat, 'Chobe National Park 50km Buffer', cloud_cover);
+  //}
+}
+
+
+
+
